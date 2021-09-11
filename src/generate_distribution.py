@@ -14,12 +14,13 @@ from get_neighbours import get_neighbours
 # R describes the probability of transitioning from some transient state to some absorbing state. 
 
 def generate_distribution(N, P):
-    states = []
+    games = []
     turns_arr = []
-    for i in tqdm(range(0, 1000000)):
+    for i in tqdm(range(0, 100000)):
         up = 0
         right = 0
         turns = 0
+        states = []
         state = (8, 8)
         states.append(state)
         while (abs(up) < 8 and abs(right) < 8):
@@ -48,6 +49,7 @@ def generate_distribution(N, P):
                 up -= 1
                 turns += 1
                 state = (possible_next[3][0], possible_next[3][1])
-            #states.append(state)
+            states.append(state)
+        games.append(states)
         turns_arr.append(turns)
-    return turns_arr#, states
+    return turns_arr, games
