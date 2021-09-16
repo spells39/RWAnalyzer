@@ -14,13 +14,13 @@ def make_prob_matrix(N, strategy_center, strategy_border):
     """
     probabilities = np.zeros(((N+1)**2, (N+1)**2))
     from itertools import product
-    for i, j in product(range(1, N), range(1, N)):
-            pc = strategy_center[i, j]
-            pb = strategy_border[i, j]
-            probabilities[(N+1) * i + j, (N+1) * (i + 0) + (j + 1)] = (1 - pc) * pb
-            probabilities[(N+1) * i + j, (N+1) * (i + 0) + (j - 1)] = pc * pb
-            probabilities[(N+1) * i + j, (N+1) * (i + 1) + (j + 0)] = pc * (1 - pb)
-            probabilities[(N+1) * i + j, (N+1) * (i - 1) + (j + 0)] = (1 - pc) * (1 - pb)
+    for x, y in product(range(1, N), range(1, N)):
+            pc = strategy_center[x, y]
+            pb = strategy_border[x, y]
+            probabilities[(N+1) * x + y, (N+1) * (x + 0) + (y + 1)] = (1 - pc) * pb
+            probabilities[(N+1) * x + y, (N+1) * (x + 0) + (y - 1)] = pc * pb
+            probabilities[(N+1) * x + y, (N+1) * (x + 1) + (y + 0)] = pc * (1 - pb)
+            probabilities[(N+1) * x + y, (N+1) * (x - 1) + (y + 0)] = (1 - pc) * (1 - pb)
     
     qr = probabilities.copy()
     
