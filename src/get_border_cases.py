@@ -11,6 +11,6 @@ def get_border_cases(N):
     for i in [0, N]:
         for j in np.arange(0, N + 1):
             border_cases.append(i * (N + 1) + j)
-            if i != j:
+            if i != j and i + j != N:
                 border_cases.append(j * (N + 1) + i)
     return border_cases
