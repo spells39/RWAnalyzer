@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def model_pvp(N, P, num_steps = 10000):
+def model_pvp(N, P, num_steps = 10000, return_hist_2d=False):
     """
     Models a PvP game via probability propagation.
     N - index of the last item in line of a square. 
@@ -45,4 +45,8 @@ def model_pvp(N, P, num_steps = 10000):
         else:
             odd += sum(val)
         prob.append(sum(val))
-    return d, prob, (even, odd)
+    hist_2d = np.sum(b, axis=0) / (num_steps + 1)
+    if return_hist_2d:
+        return d, prob, (even, odd), hist_2d
+    else:
+        return d, prob, (even, odd)
