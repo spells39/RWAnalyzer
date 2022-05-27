@@ -114,8 +114,8 @@ def objective_function(strategy_center_flat, strategy_border_flat, M):
     return mean_time_symm
 '''
 Problem:
-max by strategy_center
-    min by strategy_border
+max by strategy_center_flat
+    min by strategy_border_flat
         objective_function(strategy_center_flat, strategy_border_flat)
 N = const = 16 - the size of problem
 cnt = const = 49 - the number of variables in the first vector and the second vector
@@ -123,15 +123,28 @@ Overall 49 * 2 = 98 variables
 Expected answer is around 146, more broadly in the range [64, 225]
 '''
 
-N = 16
+'''
+Reformulate problem with negative sign:
+min by strategy_center_flat
+    max by strategy_border_flat
+        -objective_function(strategy_center_flat, strategy_border_flat)
+N = const = 16 - the size of problem
+cnt = const = 49 - the number of variables in the first vector and the second vector
+Overall 49 * 2 = 98 variables
+Expected answer is around -146, more broadly in the range [-64, -225]
+'''
+
+N = 4
 M = N - 1
 dtype = np.float64
 cnt = (M ** 2 - 1) // 4 - M // 2
 
+################################################
+# N = 16
 # example of very high value on the input that close to the boundary of variable space
 # 12106879.998128386
-strategy_center_flat = np.ones(cnt, dtype=dtype) * 0.1
-strategy_border_flat = np.ones(cnt, dtype=dtype) * 1
+# strategy_center_flat = np.ones(cnt, dtype=dtype) * 0.1
+# strategy_border_flat = np.ones(cnt, dtype=dtype) * 1
 
 # 32.151874764517075
 #strategy_center_flat = np.linspace(0, 1, cnt)
@@ -141,7 +154,17 @@ strategy_border_flat = np.ones(cnt, dtype=dtype) * 1
 #strategy_center_flat = np.random.rand(cnt)
 #strategy_border_flat = np.random.rand(cnt)
 
-print(objective_function(strategy_center_flat, strategy_border_flat, M))
-
 # 49
-print(cnt)
+#print(cnt)
+################################################
+
+################################################
+# N = 4
+# Optimal strategy for N = 4
+# Answer: 6.701562118716425
+strategy_center_flat = np.array([0.29843788])
+strategy_border_flat = np.array([0.29843788])
+################################################
+
+
+print(objective_function(strategy_center_flat, strategy_border_flat, M))
