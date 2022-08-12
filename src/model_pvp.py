@@ -1,18 +1,19 @@
 import numpy as np
 
-# Models a PvP game via probability propagation.
-# N - index of the last item in line of a square. 
-# P - transition matrix consisting of matrices Q and R. 
-# Q describes the probability of transitioning from some transient state to another while
-# R describes the probability of transitioning from some transient state to some absorbing state.  
 
-def model_pvp(N, P):
+def model_pvp(N, P, num_steps = 10000, return_hist_2d=False):
+    """
+    Models a PvP game via probability propagation.
+    N - index of the last item in line of a square. 
+    P - transition matrix consisting of matrices Q and R. 
+    Q describes the probability of transitioning from some transient state to another while
+    R describes the probability of transitioning from some transient state to some absorbing state.  
+    """
     a = np.zeros((N + 1, N + 1), dtype = np.int64).tolist()
     a[N // 2][N // 2] = 1
     b = []
-    m = 10000
     
-    for k in range(m + 1):
+    for k in range(num_steps + 1):
         b += [a]
         c = [[0] * (N + 1) for i in range(N + 1)]
         for i in range(1, N):
@@ -28,7 +29,7 @@ def model_pvp(N, P):
         a = c
     d = []
     prob = []
-    for k in range(m + 1):
+    for k in range(num_steps + 1):
         res = 0
         for i in range(N + 1):
             res += b[k][i][0] + b[k][0][i] + b[k][-1][i] + b[k][i][-1]    
@@ -37,11 +38,15 @@ def model_pvp(N, P):
     even = 0
     odd = 0
     b = np.array(b)
-    for k in range (m + 1):
+    for k in range (num_steps + 1):
         val = b[k, :, 0] + b[k, :, -1] + b[k, 0, :] + b[k, -1, :]
         if (k % 2 == 0):
             even += sum(val)
         else:
             odd += sum(val)
         prob.append(sum(val))
-    return d, prob, (even, odd)
+    hist_2d = np.sum(b, axis=0) / (num_steps + 1)
+    if return_hist_2d:
+        return d, prob, (even, odd), hist_2d
+    else:
+        return d, prob, (even, odd)
