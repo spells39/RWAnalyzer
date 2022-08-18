@@ -11,6 +11,7 @@ def trajectorise(game, case, length, index):
     axes.set_yticklabels([])
     axes.set_xticklabels([])
     axes.grid()
+    axes.invert_yaxis()
     
     files = glob.glob('../Trajectories/' + str(case) + '/' + str(length) + '/temp/*.png', recursive=True)
     for f in files:
