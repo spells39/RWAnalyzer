@@ -29,13 +29,16 @@ def trajectorise(game, case, length, index):
         x_values.append(game[i][0])
         y_values.append(game[i-1][1])
         y_values.append(game[i][1])
-        axes.set_title(str(i))
+        axes.set_title(str(i) + "/" + str(len(game) - 1))
         axes.plot(x_values, y_values, 'b-')
         dot = new_position.pop(0)
         dot.remove()
         new_position = axes.plot(game[i][0], game[i][1], 'bo')
         plt.savefig('../Trajectories/' + str(case) + '/' + str(length) + '/temp/' + 
-                     str(case) + '_' + str(length) + '_' + '%04d' % (i,) + '.png')
+                     str(case) + '_' + str(length) + '_' + '%04d' % (i,) + '.png', transparent=False, \
+                facecolor='white', edgecolor='white')
+        
     plt.savefig('../Trajectories/' + str(case) + '/' + str(length) + '/' +
-                     str(case) + '_' + str(length) + '_' + '%02d' % (index,) + '.png')
+                     str(case) + '_' + str(length) + '_' + '%02d' % (index,) + '.png', transparent=False, \
+                facecolor='white', edgecolor='white')
     axes.clear()
