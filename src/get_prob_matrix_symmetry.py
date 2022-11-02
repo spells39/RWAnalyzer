@@ -26,7 +26,7 @@ def get_prob_matrix_symmetry(N, games_states):
     for i in range (0, frequencies.shape[0]):
         if (sum(frequencies[i]) != 0):
             frequencies[i] /= sum(frequencies[i])
-    qr = frequencies 
+    qr = frequencies.copy()
     border = sorted(get_border_cases(N)) # from greatest to smallest
     for i in np.arange(len(border)-1, -1, step = -1):
         frequencies = np.delete(frequencies, border[i], axis = 0)
