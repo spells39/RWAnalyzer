@@ -21,14 +21,14 @@ def get_prob_matrix(N, games_states, return_counts=False):
     frequencies = counts.astype(np.float64)
     frequencies /= np.maximum(1, frequencies.sum(axis = 1)[np.newaxis].T)
     qr = frequencies.copy()
-    frequencies = get_frequencies(qr, N)
+    frequencies = get_frequencies(N, frequencies)
     if return_counts:
         return qr, frequencies, counts
     else:
         return qr, frequencies
 
-def get_frequencies(qr, N):
-    border = get_border_cases(N)
+def get_frequencies(N, frequencies):
+    border = sorted(get_border_cases(N)) # from greatest to smallest
     for i in np.arange(len(border)-1, -1, step = -1):
         frequencies = np.delete(frequencies, border[i], axis = 0)
         frequencies = np.delete(frequencies, border[i], axis = 1)
