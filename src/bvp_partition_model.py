@@ -13,8 +13,6 @@ from model_pvp import model_pvp
 
 
 DEFAULT_BVP_SMOOTH_ALPHA = 3.0
-PURE_BORDER_VERTICAL = ("up", "down")
-PURE_BORDER_HORIZONTAL = ("right", "left")
 
 OFFSETS = {
     "up": (-1, 0),
@@ -65,11 +63,6 @@ def move_global_index(global_index, global_n, direction):
     return (row + dr) * global_n + (col + dc)
 
 
-def is_inner_state(global_index, global_n):
-    row, col = get_row_col(global_index, global_n)
-    return 1 <= row <= global_n - 2 and 1 <= col <= global_n - 2
-
-
 def compute_distance_to_center(global_index, global_n):
     center_row = global_n // 2
     center_col = global_n // 2
@@ -81,36 +74,6 @@ def compute_distance_to_border(global_index, global_n):
     row, col = get_row_col(global_index, global_n)
     distances = [row, global_n - 1 - row, col, global_n - 1 - col]
     return min(distances)
-
-
-def get_quarter(global_index, global_n):
-    row, col = get_row_col(global_index, global_n)
-    center_row = global_n // 2
-    center_col = global_n // 2
-    if row == center_row and col == center_col:
-        return 0
-    if row == center_row:
-        return 8 if col > center_col else 4
-    if col == center_col:
-        return 2 if row < center_row else 6
-    if row < center_row:
-        return 1 if col > center_col else 3
-    return 7 if col > center_col else 5
-
-
-def preferred_border_directions(global_index, global_n):
-    quarter = get_quarter(global_index, global_n)
-    return {
-        0: set(),
-        1: {"up", "right"},
-        2: {"up"},
-        3: {"up", "left"},
-        4: {"left"},
-        5: {"down", "left"},
-        6: {"down"},
-        7: {"down", "right"},
-        8: {"right"},
-    }[quarter]
 
 
 def compute_radius(global_n):
