@@ -3,7 +3,7 @@ import os
 import numpy as np
 import scipy.linalg
 from scipy.optimize import fsolve
-from scipy.special import expit
+from scipy.special import expit, logit
 from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 
@@ -12,7 +12,11 @@ from make_prob_matrix import make_prob_matrix
 from model_pvp import model_pvp
 
 
-DEFAULT_BVP_SMOOTH_ALPHA = 3.0
+DEFAULT_BVP_SMOOTH_ALPHA = 1.5
+LEGACY_BVP_STRATEGY_TIE_TOL = 1e-3
+DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE = 8.0
+DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT = 1.0
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE = 6.0
 
 OFFSETS = {
     "up": (-1, 0),
@@ -22,9 +26,17 @@ OFFSETS = {
 }
 
 
-def find_max(func, game):
+def find_max(func, game, temperature=None):
     value_if_strategy_0 = func(0.0, game)
     value_if_strategy_1 = func(1.0, game)
+
+    if temperature is not None:
+        delta = (value_if_strategy_0 - value_if_strategy_1) / temperature
+        delta = np.clip(delta, -60.0, 60.0)
+        p = 1.0 / (1.0 + np.exp(-delta))
+        value = func(p, game)
+        return value, p
+
     if value_if_strategy_0 < value_if_strategy_1:
         return value_if_strategy_0, 0.0
     return value_if_strategy_1, 1.0
@@ -36,6 +48,50 @@ def get_win(p, game):
 
 def get_value(game):
     return find_max(get_win, game)
+
+
+def compute_legacy_bvp_soft_temperature(epsilon):
+    if epsilon <= 0.0:
+        return None
+    return DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE * (epsilon ** DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT)
+
+
+def sharpen_legacy_bvp_probability(p, epsilon):
+    if epsilon <= 0.0:
+        return p
+    p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
+    sharpen = 1.0 + DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE * epsilon
+    return float(expit(logit(p) * sharpen))
+
+
+def get_value_with_border_tiebreak(game, global_index, global_n, epsilon):
+    value_if_strategy_0 = get_win(0.0, game)
+    value_if_strategy_1 = get_win(1.0, game)
+
+    if epsilon <= 0.0:
+        preferred_strategy = _legacy_quarter_border_tiebreak(global_index, global_n)
+        if preferred_strategy == "vertical":
+            return value_if_strategy_1, 1.0
+        if preferred_strategy == "horizontal":
+            return value_if_strategy_0, 0.0
+
+    if abs(value_if_strategy_1 - value_if_strategy_0) <= LEGACY_BVP_STRATEGY_TIE_TOL:
+        preferred_strategy = _legacy_quarter_border_tiebreak(global_index, global_n)
+        if preferred_strategy == "vertical":
+            return value_if_strategy_1, 1.0
+        if preferred_strategy == "horizontal":
+            return value_if_strategy_0, 0.0
+
+    effective_temperature = None
+    if epsilon > 0.0:
+        effective_temperature = compute_legacy_bvp_soft_temperature(epsilon)
+
+    if effective_temperature is None:
+        return find_max(get_win, game, temperature=None)
+
+    _, soft_p = find_max(get_win, game, temperature=effective_temperature)
+    p = sharpen_legacy_bvp_probability(soft_p, epsilon)
+    return get_win(p, game), p
 
 
 def inner_n_to_global_N(index, inner_n, global_n):
@@ -80,6 +136,62 @@ def compute_radius(global_n):
     return global_n // 4
 
 
+def _legacy_preferred_border_strategy(global_index, global_n):
+    vertical_best = min(
+        compute_distance_to_border(move_global_index(global_index, global_n, "up"), global_n),
+        compute_distance_to_border(move_global_index(global_index, global_n, "down"), global_n),
+    )
+    horizontal_best = min(
+        compute_distance_to_border(move_global_index(global_index, global_n, "left"), global_n),
+        compute_distance_to_border(move_global_index(global_index, global_n, "right"), global_n),
+    )
+
+    if vertical_best < horizontal_best:
+        return "vertical"
+    if horizontal_best < vertical_best:
+        return "horizontal"
+    return None
+
+
+def _legacy_quarter_border_tiebreak(global_index, global_n):
+    center_row = global_n // 2
+    center_col = global_n // 2
+    row, col = get_row_col(global_index, global_n)
+
+    vertical_offset = abs(row - center_row)
+    horizontal_offset = abs(col - center_col)
+
+    if vertical_offset > horizontal_offset:
+        return "vertical"
+    if horizontal_offset > vertical_offset:
+        return "horizontal"
+    return None
+
+
+def _legacy_base_transition_value(next_global_index, w, n, inner_n, border_cases):
+    if next_global_index in border_cases:
+        return 1.0
+    next_inner_index = global_N_to_inner_n(next_global_index, inner_n, n)
+    return w[next_inner_index] + 1.0
+
+
+def _legacy_preferred_border_strategy_by_value(index, w, n, inner_n, border_cases):
+    vertical_value = 0.5 * (
+        _legacy_base_transition_value(index - n, w, n, inner_n, border_cases)
+        + _legacy_base_transition_value(index + n, w, n, inner_n, border_cases)
+    )
+    horizontal_value = 0.5 * (
+        _legacy_base_transition_value(index + 1, w, n, inner_n, border_cases)
+        + _legacy_base_transition_value(index - 1, w, n, inner_n, border_cases)
+    )
+
+    if vertical_value < horizontal_value:
+        return "vertical"
+    if horizontal_value < vertical_value:
+        return "horizontal"
+    return None
+
+
 def ensure_output_dirs(output_absorption_images1, output_absorption_images2, output_absorption_images3, qr_matrices):
     os.makedirs(output_absorption_images1, exist_ok=True)
     os.makedirs(output_absorption_images2, exist_ok=True)
@@ -109,17 +221,21 @@ def find_mean_time_banded(A, N):
 # Legacy epsilon_border-style BvP solver is preserved below as *_legacy helpers.
 
 
-def _legacy_compute_epsilon_border(inner_index, epsilon, direction, radius, global_n, inner_n):
-    global_index = inner_n_to_global_N(inner_index, inner_n, global_n)
+def _legacy_compute_epsilon_border(index, w, epsilon, direction, radius, global_n, inner_n, border_cases):
+    global_index = index
     cur_distance = compute_distance_to_center(global_index, global_n)
-    distance_to_border = compute_distance_to_border(global_index, global_n)
 
     if cur_distance <= radius:
         return 0.0
 
-    new_global_index = move_global_index(global_index, global_n, direction)
-    new_distance_to_border = compute_distance_to_border(new_global_index, global_n)
-    if new_distance_to_border < distance_to_border:
+    preferred_strategy = _legacy_preferred_border_strategy_by_value(index, w, global_n, inner_n, border_cases)
+    if preferred_strategy is None:
+        preferred_strategy = _legacy_preferred_border_strategy(global_index, global_n)
+    if preferred_strategy is None:
+        return 0.0
+
+    direction_strategy = "vertical" if direction in ("up", "down") else "horizontal"
+    if direction_strategy == preferred_strategy:
         return epsilon
     return -epsilon
 
@@ -137,7 +253,7 @@ def _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "up", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "up", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -145,7 +261,7 @@ def _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "down", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "down", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -153,7 +269,7 @@ def _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "right", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "right", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -161,7 +277,7 @@ def _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "left", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "left", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -170,7 +286,7 @@ def _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases):
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
         game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, _ = get_value(game_mx)
+        v, _ = get_value_with_border_tiebreak(game_mx, index, n, epsilon)
         eqs[i] = w[i] - v
     return tuple(eqs)
 
@@ -182,7 +298,7 @@ def _legacy_compute_state_values(w, epsilon, n, inner_n, radius, border_cases):
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
         game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, q1 = get_value(game_mx)
+        v, q1 = get_value_with_border_tiebreak(game_mx, index, n, epsilon)
         p1s.append(0.5)
         q1s.append(q1)
         vs.append(v)
@@ -212,6 +328,7 @@ def solve_bvp_sweep_legacy(
     w_new_list = []
     strategy_snapshots = []
     mean_times = []
+    previous_solution = None
 
     for epsilon in tqdm(epsilon_values, desc="Solving legacy equations"):
         message = ""
@@ -221,7 +338,10 @@ def solve_bvp_sweep_legacy(
             if attempts > max_attempts:
                 raise RuntimeError(f"Failed to converge for epsilon={epsilon:.3f}: {message}")
 
-            starting_params = np.random.random(inner_n ** 2) * (inner_n - 1) ** 2
+            if previous_solution is not None and attempts == 1:
+                starting_params = previous_solution
+            else:
+                starting_params = np.random.random(inner_n ** 2) * (inner_n - 1) ** 2
             w_new, _, _, message = fsolve(
                 lambda w: _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases),
                 tuple(starting_params),
@@ -229,6 +349,7 @@ def solve_bvp_sweep_legacy(
             )
 
         w_new_list.append(w_new)
+        previous_solution = w_new
         p1_flat, q1_flat, v_flat = _legacy_compute_state_values(w_new, epsilon, n, inner_n, radius, border_cases)
         p1_matrix = np.reshape(p1_flat, (inner_n, inner_n))
         q1_matrix = np.reshape(q1_flat, (inner_n, inner_n))

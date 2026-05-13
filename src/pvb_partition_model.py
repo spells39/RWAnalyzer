@@ -11,6 +11,14 @@ from get_border_cases import get_border_cases
 from make_prob_matrix import make_prob_matrix
 from model_pvp import model_pvp
 
+LEGACY_PVB_VALUE_TIE_TOL = 1e-6
+LEGACY_PVB_STRATEGY_TIE_TOL = 1e-3
+DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_SCALE = 8.0
+DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_EXPONENT = 1.0
+DEFAULT_LEGACY_PVB_SOFT_SHARPEN_SCALE = 6.0
+DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_SCALE = 0.35
+DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_EXPONENT = 0.5
+
 
 def find_max(func, game, temperature=None):
     value_if_strategy_0 = func(0.0, game)
@@ -22,17 +30,77 @@ def find_max(func, game, temperature=None):
         return value_if_strategy_1, 1.0
 
     delta = (value_if_strategy_1 - value_if_strategy_0) / temperature
+    delta = np.clip(delta, -60.0, 60.0)
     p = 1.0 / (1.0 + np.exp(-delta))
     value = func(p, game)
     return value, p
 
 
 def get_win(p, game):
+    # p = 1.0 -> center chooses the up/right strategy
+    # p = 0.0 -> center chooses the down/left strategy
     return (p / 2.0) * (game[0, 0] + game[0, 1]) + ((1.0 - p) / 2.0) * (game[1, 0] + game[1, 1])
 
 
 def get_value(game, temperature=None):
     return find_max(get_win, game, temperature=temperature)
+
+
+def compute_legacy_pvb_soft_temperature(epsilon):
+    if epsilon <= 0.0:
+        return None
+    return DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_SCALE * (epsilon ** DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_EXPONENT)
+
+
+def sharpen_legacy_pvb_probability(p, epsilon):
+    if epsilon <= 0.0:
+        return p
+    p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
+    sharpen = 1.0 + DEFAULT_LEGACY_PVB_SOFT_SHARPEN_SCALE * epsilon
+    return float(expit(logit(p) * sharpen))
+
+
+def compute_legacy_pvb_geometry_blend_weight(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    return float(
+        np.clip(
+            DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_SCALE * (epsilon ** DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_EXPONENT),
+            0.0,
+            1.0,
+        )
+    )
+
+
+def get_value_with_center_tiebreak(game, global_index, global_n, epsilon, temperature=None):
+    value_if_strategy_0 = get_win(0.0, game)
+    value_if_strategy_1 = get_win(1.0, game)
+
+    if (
+        epsilon <= 0.0
+        and temperature is None
+        and abs(value_if_strategy_1 - value_if_strategy_0) <= LEGACY_PVB_STRATEGY_TIE_TOL
+    ):
+        preferred_strategy = _legacy_diagonal_center_tiebreak(global_index, global_n)
+        if preferred_strategy == "up_right":
+            return value_if_strategy_1, 1.0
+        if preferred_strategy == "down_left":
+            return value_if_strategy_0, 0.0
+        return get_win(0.5, game), 0.5
+
+    effective_temperature = temperature
+    if effective_temperature is None and epsilon > 0.0:
+        effective_temperature = compute_legacy_pvb_soft_temperature(epsilon)
+
+    if effective_temperature is None:
+        return find_max(get_win, game, temperature=None)
+
+    _, soft_p = find_max(get_win, game, temperature=effective_temperature)
+    p = sharpen_legacy_pvb_probability(soft_p, epsilon)
+    geometry_p = 1.0 - compute_geometric_center_probability(global_index, epsilon, global_n)
+    geometry_weight = compute_legacy_pvb_geometry_blend_weight(epsilon)
+    p = (1.0 - geometry_weight) * p + geometry_weight * geometry_p
+    return get_win(p, game), p
 
 
 def inner_n_to_global_N(index, inner_n, global_n):
@@ -81,19 +149,110 @@ def move_global_index(global_index, global_n, direction):
     return global_index + offsets[direction]
 
 
-def compute_epsilon_border(inner_index, epsilon, direction, radius, global_n, inner_n):
-    global_index = inner_n_to_global_N(inner_index, inner_n, global_n)
+def _legacy_base_transition_value(next_global_index, w, n, inner_n, border_cases):
+    if next_global_index in border_cases:
+        return 1.0
+    next_inner_index = global_N_to_inner_n(next_global_index, inner_n, n)
+    return w[next_inner_index] + 1.0
+
+
+def _legacy_center_step_delta(global_index, global_n, direction):
+    current_distance = compute_distance_to_center(global_index, global_n)
+    next_distance = compute_distance_to_center(move_global_index(global_index, global_n, direction), global_n)
+    return current_distance - next_distance
+
+
+def _legacy_center_strategy_scores(global_index, global_n):
+    score_up_right = 0.5 * (
+        _legacy_center_step_delta(global_index, global_n, "up")
+        + _legacy_center_step_delta(global_index, global_n, "right")
+    )
+    score_down_left = 0.5 * (
+        _legacy_center_step_delta(global_index, global_n, "down")
+        + _legacy_center_step_delta(global_index, global_n, "left")
+    )
+    return score_up_right, score_down_left
+
+
+def _legacy_preferred_center_strategy(global_index, global_n):
+    up_right_distance = 0.5 * (
+        compute_distance_to_center(move_global_index(global_index, global_n, "up"), global_n)
+        + compute_distance_to_center(move_global_index(global_index, global_n, "right"), global_n)
+    )
+    down_left_distance = 0.5 * (
+        compute_distance_to_center(move_global_index(global_index, global_n, "down"), global_n)
+        + compute_distance_to_center(move_global_index(global_index, global_n, "left"), global_n)
+    )
+
+    if up_right_distance < down_left_distance:
+        return "up_right"
+    if down_left_distance < up_right_distance:
+        return "down_left"
+    return None
+
+
+def _legacy_preferred_center_strategy_by_value(index, w, n, inner_n, border_cases):
+    up_right_value = 0.5 * (
+        _legacy_base_transition_value(index - n, w, n, inner_n, border_cases)
+        + _legacy_base_transition_value(index + 1, w, n, inner_n, border_cases)
+    )
+    down_left_value = 0.5 * (
+        _legacy_base_transition_value(index + n, w, n, inner_n, border_cases)
+        + _legacy_base_transition_value(index - 1, w, n, inner_n, border_cases)
+    )
+
+    if up_right_value > down_left_value:
+        return "up_right"
+    if down_left_value > up_right_value:
+        return "down_left"
+    return None
+
+
+def _legacy_diagonal_center_tiebreak(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    if row > col:
+        return "up_right"
+    if row < col:
+        return "down_left"
+    return None
+
+
+def _legacy_preferred_center_strategy_with_baseline(index, w, global_n, inner_n, border_cases):
+    global_index = index
+    baseline_strategy = _legacy_diagonal_center_tiebreak(global_index, global_n)
+    if baseline_strategy is not None:
+        return baseline_strategy
+
+    preferred_strategy = None
+    if w is not None and border_cases is not None:
+        preferred_strategy = _legacy_preferred_center_strategy_by_value(index, w, global_n, inner_n, border_cases)
+    if preferred_strategy is not None:
+        return preferred_strategy
+
+    return _legacy_preferred_center_strategy(global_index, global_n)
+
+
+def compute_epsilon_border(index, w, epsilon, direction, radius, global_n, inner_n, border_cases):
+    global_index = index
     cur_distance = compute_distance_to_center(global_index, global_n)
-    distance_to_border = compute_distance_to_border(global_index, global_n)
 
     if cur_distance <= radius:
         return 0.0
 
-    new_global_index = move_global_index(global_index, global_n, direction)
-    new_distance_to_border = compute_distance_to_border(new_global_index, global_n)
-    if new_distance_to_border < distance_to_border:
-        return -epsilon
-    return epsilon
+    preferred_strategy = _legacy_preferred_center_strategy_with_baseline(
+        index,
+        w,
+        global_n,
+        inner_n,
+        border_cases,
+    )
+    if preferred_strategy is None:
+        return 0.0
+
+    direction_strategy = "up_right" if direction in ("up", "right") else "down_left"
+    if direction_strategy == preferred_strategy:
+        return epsilon
+    return -epsilon
 
 
 def get_game(index, w, epsilon, radius, n, inner_n, border_cases):
@@ -109,7 +268,7 @@ def compute_a11(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - n, inner_n, n)
-    adjusted_epsilon = compute_epsilon_border(next_inner_index, epsilon, "up", radius, n, inner_n)
+    adjusted_epsilon = compute_epsilon_border(index, w, epsilon, "up", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -117,7 +276,7 @@ def compute_a21(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + n, inner_n, n)
-    adjusted_epsilon = compute_epsilon_border(next_inner_index, epsilon, "down", radius, n, inner_n)
+    adjusted_epsilon = compute_epsilon_border(index, w, epsilon, "down", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -125,7 +284,7 @@ def compute_a12(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + 1, inner_n, n)
-    adjusted_epsilon = compute_epsilon_border(next_inner_index, epsilon, "right", radius, n, inner_n)
+    adjusted_epsilon = compute_epsilon_border(index, w, epsilon, "right", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -133,7 +292,7 @@ def compute_a22(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - 1, inner_n, n)
-    adjusted_epsilon = compute_epsilon_border(next_inner_index, epsilon, "left", radius, n, inner_n)
+    adjusted_epsilon = compute_epsilon_border(index, w, epsilon, "left", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -142,7 +301,13 @@ def prepare_equations(w, epsilon, n, inner_n, radius, border_cases, player_tempe
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
         game_mx = get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, _ = get_value(game_mx, temperature=player_temperature)
+        v, _ = get_value_with_center_tiebreak(
+            game_mx,
+            index,
+            n,
+            epsilon,
+            temperature=player_temperature,
+        )
         eqs[i] = w[i] - v
     return tuple(eqs)
 
@@ -154,7 +319,15 @@ def compute_state_values(w, epsilon, n, inner_n, radius, border_cases, player_te
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
         game_mx = get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, p1 = get_value(game_mx, temperature=player_temperature)
+        v, p1 = get_value_with_center_tiebreak(
+            game_mx,
+            index,
+            n,
+            epsilon,
+            temperature=player_temperature,
+        )
+        # Save snapshots in canonical user-facing semantics:
+        # 1.0 -> up/right, 0.0 -> down/left
         p1s.append(p1)
         q1s.append(0.5)
         vs.append(v)
@@ -184,8 +357,14 @@ def validate_pvb_geometry(n, inner_n, radius):
     for inner_index in range(inner_n ** 2):
         global_index = inner_n_to_global_N(inner_index, inner_n, n)
         row, col = get_row_col(global_index, n)
-        current_border_distance = compute_distance_to_border(global_index, n)
         current_center_distance = compute_distance_to_center(global_index, n)
+        preferred_strategy = _legacy_preferred_center_strategy_with_baseline(
+            global_index,
+            None,
+            n,
+            inner_n,
+            None,
+        )
 
         for direction, (dr, dc) in {
             "up": (-1, 0),
@@ -198,21 +377,31 @@ def validate_pvb_geometry(n, inner_n, radius):
             if not (1 <= next_row <= n - 2 and 1 <= next_col <= n - 2):
                 continue
 
-            next_global_index = next_row * n + next_col
-            next_border_distance = compute_distance_to_border(next_global_index, n)
-            epsilon_sign = np.sign(
-                compute_epsilon_border(inner_index, 1.0, direction, radius, n, inner_n)
-            )
+            epsilon_value = compute_epsilon_border(global_index, None, 1.0, direction, radius, n, inner_n, None)
+            epsilon_sign = np.sign(epsilon_value)
+            if preferred_strategy is None:
+                expected_sign = 0.0
+            else:
+                use_up_right = direction in ("up", "right")
+                expected_sign = 1.0 if (use_up_right == (preferred_strategy == "up_right")) else -1.0
 
             if current_center_distance <= radius and epsilon_sign != 0.0:
                 raise AssertionError("Center radius should suppress epsilon.")
 
             if current_center_distance > radius:
-                expected_sign = -1.0 if next_border_distance < current_border_distance else 1.0
                 if epsilon_sign != expected_sign:
                     raise AssertionError(
                         f"Unexpected epsilon sign for state={inner_index}, direction={direction}."
                     )
+
+
+def build_symmetric_legacy_start(inner_n, global_n):
+    values = np.zeros(inner_n ** 2, dtype=float)
+    for inner_index in range(inner_n ** 2):
+        global_index = inner_n_to_global_N(inner_index, inner_n, global_n)
+        # Symmetric proxy for absorption time: farther from border => larger value.
+        values[inner_index] = float(compute_distance_to_border(global_index, global_n) + 1.0)
+    return values
 
 
 def ensure_output_dirs(output_absorption_images1, output_absorption_images2, output_absorption_images3, qr_matrices):
@@ -230,6 +419,8 @@ def solve_pvb_sweep(
     output_absorption_images2,
     output_absorption_images3,
     qr_matrices,
+    real_pmf_path=None,
+    num_steps=999,
     player_temperature=None,
     max_attempts=100,
 ):
@@ -245,10 +436,17 @@ def solve_pvb_sweep(
         for value in epsilon_values:
             file.write(f"{value:.3f}\n")
 
+    real_pmf = None
+    if real_pmf_path is not None:
+        real_pmf = np.load(real_pmf_path)[: num_steps + 1].astype(float)
+        if real_pmf.sum() > 0:
+            real_pmf /= real_pmf.sum()
+
     w_new_list = []
     strategy_snapshots = []
     mean_times = []
-
+    fit_scores = []
+    symmetric_start = build_symmetric_legacy_start(inner_n, n)
     for epsilon in tqdm(epsilon_values, desc="Solving equations"):
         message = ""
         attempts = 0
@@ -257,7 +455,10 @@ def solve_pvb_sweep(
             if attempts > max_attempts:
                 raise RuntimeError(f"Failed to converge for epsilon={epsilon:.3f}: {message}")
 
-            starting_params = np.random.random(inner_n ** 2) * (inner_n - 2) ** 2
+            if attempts == 1:
+                starting_params = symmetric_start
+            else:
+                starting_params = np.random.random(inner_n ** 2) * (inner_n - 2) ** 2
             w_new, _, _, message = fsolve(
                 lambda w: prepare_equations(
                     w,
@@ -273,7 +474,6 @@ def solve_pvb_sweep(
             )
 
         w_new_list.append(w_new)
-
         p1_flat, q1_flat, v_flat = compute_state_values(
             w_new,
             epsilon,
@@ -292,9 +492,18 @@ def solve_pvb_sweep(
             np.pad(p1_matrix, pad_width=1, mode="constant", constant_values=0).T,
             np.pad(q1_matrix, pad_width=1, mode="constant", constant_values=0).T,
         )
-        mean_time, _ = find_mean_time_banded(probability_optimal, N - 1)
+        mean_time, state_mean_times = find_mean_time_banded(probability_optimal, N - 1)
         mean_times.append(mean_time)
         np.save(qr_matrices + f"qr_{epsilon:.2f}", qr_optimal)
+
+        fit_score = None
+        if real_pmf is not None:
+            _, prob, _ = model_pvp(N, qr_optimal, num_steps=num_steps)
+            prob = np.asarray(prob, dtype=float)
+            if prob.sum() > 0:
+                prob /= prob.sum()
+            fit_score = float(jensenshannon(real_pmf, prob))
+        fit_scores.append(fit_score)
 
         strategy_snapshots.append(
             {
@@ -304,6 +513,8 @@ def solve_pvb_sweep(
                 "vs": v_flat,
                 "w": w_new,
                 "mean_time": float(mean_time),
+                "state_mean_times": state_mean_times,
+                "jsd": fit_score,
             }
         )
 
@@ -311,22 +522,23 @@ def solve_pvb_sweep(
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
 
+    if real_pmf is not None:
+        with open(output_duration + "jsd.txt", "w") as file:
+            for score in fit_scores:
+                file.write(f"{score} ")
+
     return {
         "n": n,
         "N": N,
         "inner_n": inner_n,
         "radius": radius,
-        "epsilon_values": np.array(epsilon_values),
+        "epsilon_values": np.array(epsilon_values, dtype=float),
         "w_new_list": w_new_list,
         "strategy_snapshots": strategy_snapshots,
-        "mean_times": np.array(mean_times),
+        "mean_times": np.array(mean_times, dtype=float),
+        "fit_scores": fit_scores,
         "player_temperature": player_temperature,
     }
-
-
-def load_empirical_center_strategy(strategy_path):
-    return np.load(strategy_path)
-
 
 def scale_center_strategy_logit(strategy_center, epsilon, clip=1e-4):
     clipped = np.clip(strategy_center, clip, 1.0 - clip)
@@ -395,7 +607,7 @@ def solve_pvb_empirical_strategy_sweep(
     real_pmf_path=None,
     num_steps=999,
 ):
-    strategy_center_base = load_empirical_center_strategy(strategy_center_path)
+    strategy_center_base = center_strategy_from_matrix_probability(np.load(strategy_center_path))
     N = strategy_center_base.shape[0] - 1
     inner_n = N - 1
     n = N + 1
