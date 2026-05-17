@@ -1,4 +1,6 @@
 import os
+import time
+from functools import lru_cache
 
 import numpy as np
 import scipy.linalg
@@ -14,9 +16,30 @@ from model_pvp import model_pvp
 
 DEFAULT_BVP_SMOOTH_ALPHA = 1.5
 LEGACY_BVP_STRATEGY_TIE_TOL = 1e-3
-DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE = 8.0
-DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT = 1.0
-DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE = 6.0
+DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_FLOOR = 0.65
+DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE = 0.3
+DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT = 0.75
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE = 1.2
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_EXPONENT = 2.0
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_SCALE = 0.25
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_CENTER = 0.50
+DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_WIDTH = 0.25
+DEFAULT_LEGACY_BVP_SCORE_SMOOTHING_WEIGHT = 0.10
+DEFAULT_LEGACY_BVP_AXIS_ROLLOUT_HORIZON = 4
+DEFAULT_LEGACY_BVP_AXIS_ROLLOUT_DECAY = 0.72
+DEFAULT_LEGACY_BVP_AXIS_STATIC_EFFICIENCY_WEIGHT = 0.65
+DEFAULT_LEGACY_BVP_AXIS_HIT_WEIGHT = 0.75
+DEFAULT_LEGACY_BVP_AXIS_PROXIMITY_WEIGHT = 0.40
+DEFAULT_LEGACY_BVP_SOFT_VALUE_TIEBREAK_SCALE = 0.2
+DEFAULT_LEGACY_BVP_ACTIVATION_SCALE = 0.03
+DEFAULT_LEGACY_BVP_ACTIVATION_EXPONENT = 1.4
+DEFAULT_LEGACY_BVP_LOCAL_SCORE_NORMALIZATION_WEIGHT = 0.40
+DEFAULT_LEGACY_BVP_LOCAL_SCORE_NORMALIZATION_GAIN = 0.60
+DEFAULT_LEGACY_BVP_BORDER_CONTRAST_BASE = 0.90
+DEFAULT_LEGACY_BVP_BORDER_CONTRAST_SCALE = 0.10
+DEFAULT_LEGACY_BVP_CENTER_EPSILON_FLOOR = 0.05
+DEFAULT_LEGACY_BVP_CENTER_EPSILON_MAX_WEIGHT = 0.80
+DEFAULT_LEGACY_BVP_CENTER_EPSILON_EXPONENT = 2.0
 
 OFFSETS = {
     "up": (-1, 0),
@@ -53,44 +76,77 @@ def get_value(game):
 def compute_legacy_bvp_soft_temperature(epsilon):
     if epsilon <= 0.0:
         return None
-    return DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE * (epsilon ** DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT)
+    return (
+        DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_FLOOR
+        + DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_SCALE * (epsilon ** DEFAULT_LEGACY_BVP_SOFT_TEMPERATURE_EXPONENT)
+    )
 
 
 def sharpen_legacy_bvp_probability(p, epsilon):
     if epsilon <= 0.0:
         return p
     p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
-    sharpen = 1.0 + DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE * epsilon
+    mid_boost = DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_SCALE * np.exp(
+        -(
+            (epsilon - DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_CENTER)
+            / DEFAULT_LEGACY_BVP_SOFT_SHARPEN_MID_BOOST_WIDTH
+        )
+        ** 2
+    )
+    sharpen = 1.0 + DEFAULT_LEGACY_BVP_SOFT_SHARPEN_SCALE * (
+        epsilon ** DEFAULT_LEGACY_BVP_SOFT_SHARPEN_EXPONENT
+    ) + mid_boost
     return float(expit(logit(p) * sharpen))
 
 
-def get_value_with_border_tiebreak(game, global_index, global_n, epsilon):
+def compute_legacy_bvp_baseline_blend_weight(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    scaled_epsilon = epsilon / DEFAULT_LEGACY_BVP_ACTIVATION_SCALE
+    return float(1.0 - np.exp(-(scaled_epsilon ** DEFAULT_LEGACY_BVP_ACTIVATION_EXPONENT)))
+
+
+def get_value_with_border_tiebreak(game, global_index, global_n, epsilon, geometry_context=None):
     value_if_strategy_0 = get_win(0.0, game)
     value_if_strategy_1 = get_win(1.0, game)
 
+    if geometry_context is not None:
+        quarter_preference = geometry_context["quarter_preference"][global_index]
+        baseline_p = geometry_context["baseline_probability"][global_index]
+        score_delta = geometry_context["smoothed_score_delta"][global_index]
+        border_contrast = geometry_context.get("border_contrast", {}).get(global_index, 1.0)
+    else:
+        quarter_preference = _legacy_quarter_border_tiebreak(global_index, global_n)
+        baseline_p = _legacy_quarter_border_baseline_probability(global_index, global_n)
+        raw_score_delta = _legacy_bvp_smoothed_score_delta(global_index, global_n)
+        score_delta = _legacy_bvp_locally_normalized_score_delta(global_index, global_n, raw_score_delta)
+        border_contrast = _legacy_bvp_border_contrast(global_index, global_n)
+
     if epsilon <= 0.0:
-        preferred_strategy = _legacy_quarter_border_tiebreak(global_index, global_n)
-        if preferred_strategy == "vertical":
+        if quarter_preference == "vertical":
             return value_if_strategy_1, 1.0
-        if preferred_strategy == "horizontal":
+        if quarter_preference == "horizontal":
             return value_if_strategy_0, 0.0
 
     if abs(value_if_strategy_1 - value_if_strategy_0) <= LEGACY_BVP_STRATEGY_TIE_TOL:
-        preferred_strategy = _legacy_quarter_border_tiebreak(global_index, global_n)
-        if preferred_strategy == "vertical":
+        if quarter_preference == "vertical":
             return value_if_strategy_1, 1.0
-        if preferred_strategy == "horizontal":
+        if quarter_preference == "horizontal":
             return value_if_strategy_0, 0.0
 
-    effective_temperature = None
-    if epsilon > 0.0:
-        effective_temperature = compute_legacy_bvp_soft_temperature(epsilon)
-
-    if effective_temperature is None:
+    if epsilon <= 0.0:
         return find_max(get_win, game, temperature=None)
 
-    _, soft_p = find_max(get_win, game, temperature=effective_temperature)
-    p = sharpen_legacy_bvp_probability(soft_p, epsilon)
+    score_strength = compute_legacy_bvp_soft_temperature(epsilon)
+    value_margin = value_if_strategy_1 - value_if_strategy_0
+    value_tiebreak = np.tanh(value_margin / max(LEGACY_BVP_STRATEGY_TIE_TOL, 1e-9))
+    score_logit = border_contrast * (
+        score_strength * score_delta + DEFAULT_LEGACY_BVP_SOFT_VALUE_TIEBREAK_SCALE * epsilon * value_tiebreak
+    )
+    score_p = float(expit(score_logit))
+    blend_weight = compute_legacy_bvp_baseline_blend_weight(epsilon)
+    p = (1.0 - blend_weight) * baseline_p + blend_weight * score_p
+    p = sharpen_legacy_bvp_probability(p, epsilon)
     return get_win(p, game), p
 
 
@@ -119,6 +175,17 @@ def move_global_index(global_index, global_n, direction):
     return (row + dr) * global_n + (col + dc)
 
 
+def move_global_index_absorbing(global_index, global_n, direction):
+    row, col = get_row_col(global_index, global_n)
+    if row == 0 or row == global_n - 1 or col == 0 or col == global_n - 1:
+        return global_index
+    dr, dc = OFFSETS[direction]
+    next_row = min(max(row + dr, 0), global_n - 1)
+    next_col = min(max(col + dc, 0), global_n - 1)
+    return next_row * global_n + next_col
+
+
+@lru_cache(maxsize=None)
 def compute_distance_to_center(global_index, global_n):
     center_row = global_n // 2
     center_col = global_n // 2
@@ -126,6 +193,7 @@ def compute_distance_to_center(global_index, global_n):
     return abs(row - center_row) + abs(col - center_col)
 
 
+@lru_cache(maxsize=None)
 def compute_distance_to_border(global_index, global_n):
     row, col = get_row_col(global_index, global_n)
     distances = [row, global_n - 1 - row, col, global_n - 1 - col]
@@ -153,6 +221,7 @@ def _legacy_preferred_border_strategy(global_index, global_n):
     return None
 
 
+@lru_cache(maxsize=None)
 def _legacy_quarter_border_tiebreak(global_index, global_n):
     center_row = global_n // 2
     center_col = global_n // 2
@@ -166,6 +235,211 @@ def _legacy_quarter_border_tiebreak(global_index, global_n):
     if horizontal_offset > vertical_offset:
         return "horizontal"
     return None
+
+
+@lru_cache(maxsize=None)
+def _legacy_quarter_border_baseline_probability(global_index, global_n):
+    preferred_strategy = _legacy_quarter_border_tiebreak(global_index, global_n)
+    if preferred_strategy == "vertical":
+        return 1.0
+    if preferred_strategy == "horizontal":
+        return 0.0
+    return 0.5
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_border_distances(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    vertical_distance = min(row, global_n - 1 - row)
+    horizontal_distance = min(col, global_n - 1 - col)
+    return vertical_distance, horizontal_distance
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_edge_distances(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    return (
+        row,
+        global_n - 1 - row,
+        col,
+        global_n - 1 - col,
+    )
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_border_distance(global_index, global_n, axis):
+    d_top, d_bottom, d_left, d_right = _legacy_axis_edge_distances(global_index, global_n)
+    if axis == "vertical":
+        return min(d_top, d_bottom)
+    return min(d_left, d_right)
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_escape_efficiency(global_index, global_n, axis):
+    d_top, d_bottom, d_left, d_right = _legacy_axis_edge_distances(global_index, global_n)
+    if axis == "vertical":
+        return 1.0 / ((d_top + 1.0) * (d_bottom + 1.0))
+    return 1.0 / ((d_left + 1.0) * (d_right + 1.0))
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_hits_border(global_index, global_n, axis):
+    row, col = get_row_col(global_index, global_n)
+    if axis == "vertical":
+        return row == 0 or row == global_n - 1
+    return col == 0 or col == global_n - 1
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_rollout_distribution(global_index, global_n, axis, steps):
+    if steps == 0:
+        return ((global_index, 1.0),)
+
+    aggregated = {}
+    directions = ("up", "down") if axis == "vertical" else ("left", "right")
+    for state, probability in _legacy_axis_rollout_distribution(global_index, global_n, axis, steps - 1):
+        if _legacy_axis_hits_border(state, global_n, axis):
+            aggregated[state] = aggregated.get(state, 0.0) + probability
+            continue
+
+        for direction in directions:
+            next_state = move_global_index_absorbing(state, global_n, direction)
+            aggregated[next_state] = aggregated.get(next_state, 0.0) + probability * 0.5
+
+    return tuple(sorted(aggregated.items()))
+
+
+@lru_cache(maxsize=None)
+def _legacy_axis_escape_score(global_index, global_n, axis):
+    static_efficiency = _legacy_axis_escape_efficiency(global_index, global_n, axis)
+    score = 0.0
+
+    for steps in range(1, DEFAULT_LEGACY_BVP_AXIS_ROLLOUT_HORIZON + 1):
+        rollout = _legacy_axis_rollout_distribution(global_index, global_n, axis, steps)
+        hit_probability = 0.0
+        expected_proximity = 0.0
+
+        for state, probability in rollout:
+            axis_distance = _legacy_axis_border_distance(state, global_n, axis)
+            if _legacy_axis_hits_border(state, global_n, axis):
+                hit_probability += probability
+
+            proximity = 1.0 / (axis_distance + 1.0)
+            expected_proximity += probability * proximity
+
+        weight = DEFAULT_LEGACY_BVP_AXIS_ROLLOUT_DECAY ** (steps - 1)
+        score += weight * (
+            DEFAULT_LEGACY_BVP_AXIS_HIT_WEIGHT * hit_probability
+            + DEFAULT_LEGACY_BVP_AXIS_PROXIMITY_WEIGHT * expected_proximity
+        )
+
+    return DEFAULT_LEGACY_BVP_AXIS_STATIC_EFFICIENCY_WEIGHT * static_efficiency + score
+
+
+@lru_cache(maxsize=None)
+def _legacy_bvp_score_delta(global_index, global_n):
+    vertical_score = _legacy_axis_escape_score(global_index, global_n, "vertical")
+    horizontal_score = _legacy_axis_escape_score(global_index, global_n, "horizontal")
+    normalization = abs(vertical_score) + abs(horizontal_score) + 1e-12
+    delta = (vertical_score - horizontal_score) / normalization
+
+    if abs(delta) < 1e-9:
+        quarter_preference = _legacy_quarter_border_tiebreak(global_index, global_n)
+        if quarter_preference == "vertical":
+            return 1e-6
+        if quarter_preference == "horizontal":
+            return -1e-6
+    return delta
+
+
+@lru_cache(maxsize=None)
+def _legacy_bvp_smoothed_score_delta(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    deltas = [_legacy_bvp_score_delta(global_index, global_n)]
+
+    for dr, dc in OFFSETS.values():
+        next_row = row + dr
+        next_col = col + dc
+        if 1 <= next_row <= global_n - 2 and 1 <= next_col <= global_n - 2:
+            neighbor_index = next_row * global_n + next_col
+            deltas.append(_legacy_bvp_score_delta(neighbor_index, global_n))
+
+    if len(deltas) == 1:
+        return deltas[0]
+
+    self_delta = deltas[0]
+    neighbor_mean = float(np.mean(deltas[1:]))
+    return (1.0 - DEFAULT_LEGACY_BVP_SCORE_SMOOTHING_WEIGHT) * self_delta + DEFAULT_LEGACY_BVP_SCORE_SMOOTHING_WEIGHT * neighbor_mean
+
+
+def _legacy_bvp_locally_normalized_score_delta(global_index, global_n, raw_score_delta):
+    weight = DEFAULT_LEGACY_BVP_LOCAL_SCORE_NORMALIZATION_WEIGHT
+    if weight <= 0.0:
+        return raw_score_delta
+
+    row, col = get_row_col(global_index, global_n)
+    local_values = [raw_score_delta]
+
+    for dr, dc in OFFSETS.values():
+        next_row = row + dr
+        next_col = col + dc
+        if 1 <= next_row <= global_n - 2 and 1 <= next_col <= global_n - 2:
+            neighbor_index = next_row * global_n + next_col
+            local_values.append(_legacy_bvp_smoothed_score_delta(neighbor_index, global_n))
+
+    local_scale = float(np.mean(np.abs(local_values))) + 1e-9
+    local_score_delta = float(np.tanh(DEFAULT_LEGACY_BVP_LOCAL_SCORE_NORMALIZATION_GAIN * raw_score_delta / local_scale))
+    return (1.0 - weight) * raw_score_delta + weight * local_score_delta
+
+
+@lru_cache(maxsize=None)
+def _legacy_bvp_border_contrast(global_index, global_n):
+    max_border_distance = max(1.0, (global_n - 1) / 2.0)
+    border_distance = compute_distance_to_border(global_index, global_n)
+    border_closeness = 1.0 - ((border_distance - 1.0) / max(1.0, max_border_distance - 1.0))
+    border_closeness = float(np.clip(border_closeness, 0.0, 1.0))
+    return DEFAULT_LEGACY_BVP_BORDER_CONTRAST_BASE + DEFAULT_LEGACY_BVP_BORDER_CONTRAST_SCALE * border_closeness
+
+
+def _legacy_bvp_center_epsilon_weight(center_distance, radius):
+    if radius <= 0 or center_distance > radius:
+        return 1.0
+    if center_distance <= 0:
+        return 0.0
+
+    normalized_distance = float(center_distance) / float(radius)
+    return DEFAULT_LEGACY_BVP_CENTER_EPSILON_FLOOR + (
+        DEFAULT_LEGACY_BVP_CENTER_EPSILON_MAX_WEIGHT - DEFAULT_LEGACY_BVP_CENTER_EPSILON_FLOOR
+    ) * (normalized_distance ** DEFAULT_LEGACY_BVP_CENTER_EPSILON_EXPONENT)
+
+
+def build_legacy_bvp_geometry_context(n):
+    inner_n = n - 2
+    baseline_probability = {}
+    smoothed_score_delta = {}
+    border_contrast = {}
+    quarter_preference = {}
+    center_distance = {}
+    geometric_preferred_strategy = {}
+
+    for i in range(inner_n ** 2):
+        global_index = inner_n_to_global_N(i, inner_n, n)
+        baseline_probability[global_index] = _legacy_quarter_border_baseline_probability(global_index, n)
+        raw_score_delta = _legacy_bvp_smoothed_score_delta(global_index, n)
+        smoothed_score_delta[global_index] = _legacy_bvp_locally_normalized_score_delta(global_index, n, raw_score_delta)
+        border_contrast[global_index] = _legacy_bvp_border_contrast(global_index, n)
+        quarter_preference[global_index] = _legacy_quarter_border_tiebreak(global_index, n)
+        center_distance[global_index] = compute_distance_to_center(global_index, n)
+        geometric_preferred_strategy[global_index] = _legacy_preferred_border_strategy(global_index, n)
+
+    return {
+        "baseline_probability": baseline_probability,
+        "smoothed_score_delta": smoothed_score_delta,
+        "border_contrast": border_contrast,
+        "quarter_preference": quarter_preference,
+        "center_distance": center_distance,
+        "geometric_preferred_strategy": geometric_preferred_strategy,
+    }
 
 
 def _legacy_base_transition_value(next_global_index, w, n, inner_n, border_cases):
@@ -221,84 +495,89 @@ def find_mean_time_banded(A, N):
 # Legacy epsilon_border-style BvP solver is preserved below as *_legacy helpers.
 
 
-def _legacy_compute_epsilon_border(index, w, epsilon, direction, radius, global_n, inner_n, border_cases):
+def _legacy_compute_epsilon_border(index, w, epsilon, direction, radius, global_n, inner_n, border_cases, geometry_context=None):
     global_index = index
-    cur_distance = compute_distance_to_center(global_index, global_n)
+    if geometry_context is not None:
+        cur_distance = geometry_context["center_distance"][global_index]
+    else:
+        cur_distance = compute_distance_to_center(global_index, global_n)
 
-    if cur_distance <= radius:
-        return 0.0
+    center_epsilon_weight = _legacy_bvp_center_epsilon_weight(cur_distance, radius)
 
     preferred_strategy = _legacy_preferred_border_strategy_by_value(index, w, global_n, inner_n, border_cases)
     if preferred_strategy is None:
-        preferred_strategy = _legacy_preferred_border_strategy(global_index, global_n)
+        if geometry_context is not None:
+            preferred_strategy = geometry_context["geometric_preferred_strategy"][global_index]
+        else:
+            preferred_strategy = _legacy_preferred_border_strategy(global_index, global_n)
     if preferred_strategy is None:
         return 0.0
 
     direction_strategy = "vertical" if direction in ("up", "down") else "horizontal"
     if direction_strategy == preferred_strategy:
-        return epsilon
-    return -epsilon
+        return center_epsilon_weight * epsilon
+    return -center_epsilon_weight * epsilon
 
 
-def _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases):
+def _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context=None):
     game = np.zeros((2, 2))
-    game[0, 0] = _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases)
-    game[0, 1] = _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases)
-    game[1, 0] = _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases)
-    game[1, 1] = _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases)
+    game[0, 0] = _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
+    game[0, 1] = _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
+    game[1, 0] = _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
+    game[1, 1] = _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
     return game
 
 
-def _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases):
+def _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context=None):
     if (index - n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "up", radius, n, inner_n, border_cases)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "up", radius, n, inner_n, border_cases, geometry_context)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
-def _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases):
+def _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context=None):
     if (index + n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "down", radius, n, inner_n, border_cases)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "down", radius, n, inner_n, border_cases, geometry_context)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
-def _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases):
+def _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context=None):
     if (index + 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "right", radius, n, inner_n, border_cases)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "right", radius, n, inner_n, border_cases, geometry_context)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
-def _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases):
+def _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context=None):
     if (index - 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "left", radius, n, inner_n, border_cases)
+    adjusted_epsilon = _legacy_compute_epsilon_border(index, w, epsilon, "left", radius, n, inner_n, border_cases, geometry_context)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
-def _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases):
+def _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases, geometry_context=None):
     eqs = np.zeros(len(w))
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
-        game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, _ = get_value_with_border_tiebreak(game_mx, index, n, epsilon)
+        game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
+        v, _ = get_value_with_border_tiebreak(game_mx, index, n, epsilon, geometry_context)
         eqs[i] = w[i] - v
     return tuple(eqs)
 
 
-def _legacy_compute_state_values(w, epsilon, n, inner_n, radius, border_cases):
+def _legacy_compute_state_values(w, epsilon, n, inner_n, radius, border_cases, geometry_context=None):
     p1s = []
     q1s = []
     vs = []
     for i in range(len(w)):
         index = inner_n_to_global_N(i, inner_n, n)
-        game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases)
-        v, q1 = get_value_with_border_tiebreak(game_mx, index, n, epsilon)
+        game_mx = _legacy_get_game(index, w, epsilon, radius, n, inner_n, border_cases, geometry_context)
+        v, q1 = get_value_with_border_tiebreak(game_mx, index, n, epsilon, geometry_context)
         p1s.append(0.5)
         q1s.append(q1)
         vs.append(v)
@@ -319,6 +598,7 @@ def solve_bvp_sweep_legacy(
     inner_n = n - 2
     radius = compute_radius(n)
     border_cases = get_border_cases(N)
+    geometry_context = build_legacy_bvp_geometry_context(n)
 
     ensure_output_dirs(output_absorption_images1, output_absorption_images2, output_absorption_images3, qr_matrices)
     with open(output_duration + "epsilon_values.txt", "w") as file:
@@ -328,9 +608,13 @@ def solve_bvp_sweep_legacy(
     w_new_list = []
     strategy_snapshots = []
     mean_times = []
+    solve_times = []
+    attempt_counts = []
     previous_solution = None
+    previous_previous_solution = None
 
     for epsilon in tqdm(epsilon_values, desc="Solving legacy equations"):
+        epsilon_start = time.perf_counter()
         message = ""
         attempts = 0
         while message != "The solution converged.":
@@ -338,19 +622,26 @@ def solve_bvp_sweep_legacy(
             if attempts > max_attempts:
                 raise RuntimeError(f"Failed to converge for epsilon={epsilon:.3f}: {message}")
 
-            if previous_solution is not None and attempts == 1:
+            if previous_solution is not None and previous_previous_solution is not None and attempts == 1:
+                starting_params = previous_solution + (previous_solution - previous_previous_solution)
+            elif previous_solution is not None and attempts == 1:
                 starting_params = previous_solution
+            elif previous_solution is not None:
+                starting_params = previous_solution + 0.05 * np.random.standard_normal(inner_n ** 2)
             else:
                 starting_params = np.random.random(inner_n ** 2) * (inner_n - 1) ** 2
             w_new, _, _, message = fsolve(
-                lambda w: _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases),
+                lambda w: _legacy_prepare_equations(w, epsilon, n, inner_n, radius, border_cases, geometry_context),
                 tuple(starting_params),
                 full_output=True,
             )
 
         w_new_list.append(w_new)
+        previous_previous_solution = previous_solution
         previous_solution = w_new
-        p1_flat, q1_flat, v_flat = _legacy_compute_state_values(w_new, epsilon, n, inner_n, radius, border_cases)
+        attempt_counts.append(attempts)
+        solve_times.append(time.perf_counter() - epsilon_start)
+        p1_flat, q1_flat, v_flat = _legacy_compute_state_values(w_new, epsilon, n, inner_n, radius, border_cases, geometry_context)
         p1_matrix = np.reshape(p1_flat, (inner_n, inner_n))
         q1_matrix = np.reshape(q1_flat, (inner_n, inner_n))
 
@@ -371,12 +662,22 @@ def solve_bvp_sweep_legacy(
                 "vs": v_flat,
                 "w": w_new,
                 "mean_time": float(mean_time),
+                "solve_time_sec": float(solve_times[-1]),
+                "attempts": int(attempt_counts[-1]),
             }
         )
 
     with open(output_duration + "duration.txt", "w") as file:
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
+
+    with open(output_duration + "solve_times.txt", "w") as file:
+        for solve_time in solve_times:
+            file.write(f"{solve_time} ")
+
+    with open(output_duration + "attempt_counts.txt", "w") as file:
+        for attempts in attempt_counts:
+            file.write(f"{attempts} ")
 
     return {
         "n": n,
@@ -387,6 +688,8 @@ def solve_bvp_sweep_legacy(
         "w_new_list": w_new_list,
         "strategy_snapshots": strategy_snapshots,
         "mean_times": np.array(mean_times, dtype=float),
+        "solve_times": np.array(solve_times, dtype=float),
+        "attempt_counts": np.array(attempt_counts, dtype=int),
         "mode": "border-legacy",
     }
 

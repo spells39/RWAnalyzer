@@ -18,6 +18,18 @@ DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_EXPONENT = 1.0
 DEFAULT_LEGACY_PVB_SOFT_SHARPEN_SCALE = 6.0
 DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_SCALE = 0.35
 DEFAULT_LEGACY_PVB_GEOMETRY_BLEND_EXPONENT = 0.5
+DEFAULT_PVB_BOUNDED_BIAS_SCALE = 0.46
+DEFAULT_PVB_BOUNDED_BIAS_TAU = 0.30
+DEFAULT_PVB_BOUNDED_BIAS_POWER = 0.75
+DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE = 0.15
+DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE = 0.70
+DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_TAU = 0.50
+DEFAULT_PVB_AMBIGUITY_MIX_SCALE = 0.72
+DEFAULT_PVB_AMBIGUITY_MIX_RISE = 0.28
+DEFAULT_PVB_AMBIGUITY_SCALE = 0.30
+DEFAULT_PVB_GEOMETRY_MIX_SCALE = 0.10
+DEFAULT_PVB_GEOMETRY_MIX_RISE = 0.28
+DEFAULT_PVB_GEOMETRY_SCORE_SCALE = 0.75
 
 
 def find_max(func, game, temperature=None):
@@ -50,6 +62,42 @@ def compute_legacy_pvb_soft_temperature(epsilon):
     if epsilon <= 0.0:
         return None
     return DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_SCALE * (epsilon ** DEFAULT_LEGACY_PVB_SOFT_TEMPERATURE_EXPONENT)
+
+
+def compute_pvb_bounded_bias(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    normalized = (float(epsilon) / DEFAULT_PVB_BOUNDED_BIAS_TAU) ** DEFAULT_PVB_BOUNDED_BIAS_POWER
+    return float(DEFAULT_PVB_BOUNDED_BIAS_SCALE * np.tanh(normalized))
+
+
+def compute_pvb_soft_response_temperature(epsilon):
+    if epsilon <= 0.0:
+        return None
+    return float(
+        DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE
+        + DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE
+        * np.exp(-float(epsilon) / DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_TAU)
+    )
+
+
+def compute_pvb_geometry_mix_weight(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    return float(
+        DEFAULT_PVB_GEOMETRY_MIX_SCALE
+        * (1.0 - np.exp(-float(epsilon) / DEFAULT_PVB_GEOMETRY_MIX_RISE))
+    )
+
+
+def compute_pvb_ambiguity_mix(epsilon, value_delta):
+    if epsilon <= 0.0:
+        return np.zeros_like(value_delta, dtype=float)
+    epsilon_weight = DEFAULT_PVB_AMBIGUITY_MIX_SCALE * (
+        1.0 - np.exp(-float(epsilon) / DEFAULT_PVB_AMBIGUITY_MIX_RISE)
+    )
+    ambiguity = np.exp(-np.abs(value_delta) / DEFAULT_PVB_AMBIGUITY_SCALE)
+    return epsilon_weight * ambiguity
 
 
 def sharpen_legacy_pvb_probability(p, epsilon):
@@ -88,18 +136,26 @@ def get_value_with_center_tiebreak(game, global_index, global_n, epsilon, temper
             return value_if_strategy_0, 0.0
         return get_win(0.5, game), 0.5
 
-    effective_temperature = temperature
-    if effective_temperature is None and epsilon > 0.0:
-        effective_temperature = compute_legacy_pvb_soft_temperature(epsilon)
-
-    if effective_temperature is None:
+    if epsilon <= 0.0:
         return find_max(get_win, game, temperature=None)
 
-    _, soft_p = find_max(get_win, game, temperature=effective_temperature)
-    p = sharpen_legacy_pvb_probability(soft_p, epsilon)
-    geometry_p = 1.0 - compute_geometric_center_probability(global_index, epsilon, global_n)
-    geometry_weight = compute_legacy_pvb_geometry_blend_weight(epsilon)
+    effective_temperature = temperature
+    if effective_temperature is None:
+        effective_temperature = compute_pvb_soft_response_temperature(epsilon)
+
+    value_delta = value_if_strategy_1 - value_if_strategy_0
+    p = expit(np.clip(value_delta / effective_temperature, -60.0, 60.0))
+
+    geometry_p = 1.0 - expit(
+        DEFAULT_PVB_GEOMETRY_SCORE_SCALE
+        * epsilon
+        * _legacy_geometric_center_score_delta(global_index, global_n)
+    )
+    geometry_weight = compute_pvb_geometry_mix_weight(epsilon)
     p = (1.0 - geometry_weight) * p + geometry_weight * geometry_p
+
+    ambiguity_mix = float(compute_pvb_ambiguity_mix(epsilon, np.array([value_delta]))[0])
+    p = (1.0 - ambiguity_mix) * p + ambiguity_mix * 0.5
     return get_win(p, game), p
 
 
@@ -250,9 +306,10 @@ def compute_epsilon_border(index, w, epsilon, direction, radius, global_n, inner
         return 0.0
 
     direction_strategy = "up_right" if direction in ("up", "right") else "down_left"
+    bounded_bias = compute_pvb_bounded_bias(epsilon)
     if direction_strategy == preferred_strategy:
-        return epsilon
-    return -epsilon
+        return bounded_bias
+    return -bounded_bias
 
 
 def get_game(index, w, epsilon, radius, n, inner_n, border_cases):
@@ -294,6 +351,186 @@ def compute_a22(index, w, epsilon, radius, n, inner_n, border_cases):
     next_inner_index = global_N_to_inner_n(index - 1, inner_n, n)
     adjusted_epsilon = compute_epsilon_border(index, w, epsilon, "left", radius, n, inner_n, border_cases)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
+
+
+def _strategy_to_sign(strategy):
+    if strategy == "up_right":
+        return 1.0
+    if strategy == "down_left":
+        return -1.0
+    return 0.0
+
+
+def build_pvb_solver_cache(n, inner_n, radius):
+    state_count = inner_n ** 2
+    global_indices = np.empty(state_count, dtype=np.int64)
+    next_inner_indices = np.full((state_count, 4), -1, dtype=np.int64)
+    border_moves = np.zeros((state_count, 4), dtype=bool)
+    diagonal_preferred_sign = np.zeros(state_count, dtype=float)
+    geometry_preferred_sign = np.zeros(state_count, dtype=float)
+    center_suppressed = np.zeros(state_count, dtype=bool)
+    geometric_center_score_delta = np.zeros(state_count, dtype=float)
+
+    # Direction order: up, right, down, left. This matches the local game layout.
+    offsets = np.array([-n, 1, n, -1], dtype=np.int64)
+    for inner_index in range(state_count):
+        global_index = inner_n_to_global_N(inner_index, inner_n, n)
+        global_indices[inner_index] = global_index
+        center_suppressed[inner_index] = compute_distance_to_center(global_index, n) <= radius
+        diagonal_preferred_sign[inner_index] = _strategy_to_sign(
+            _legacy_diagonal_center_tiebreak(global_index, n)
+        )
+        geometry_preferred_sign[inner_index] = _strategy_to_sign(
+            _legacy_preferred_center_strategy(global_index, n)
+        )
+        geometric_center_score_delta[inner_index] = _legacy_geometric_center_score_delta(
+            global_index,
+            n,
+        )
+
+        for direction_index, offset in enumerate(offsets):
+            next_global_index = global_index + int(offset)
+            next_row, next_col = get_row_col(next_global_index, n)
+            if 1 <= next_row <= n - 2 and 1 <= next_col <= n - 2:
+                next_inner_indices[inner_index, direction_index] = global_N_to_inner_n(
+                    next_global_index,
+                    inner_n,
+                    n,
+                )
+            else:
+                border_moves[inner_index, direction_index] = True
+
+    return {
+        "global_indices": global_indices,
+        "next_inner_indices": next_inner_indices,
+        "border_moves": border_moves,
+        "diagonal_preferred_sign": diagonal_preferred_sign,
+        "geometry_preferred_sign": geometry_preferred_sign,
+        "center_suppressed": center_suppressed,
+        "geometric_center_score_delta": geometric_center_score_delta,
+        "direction_signs": np.array([1.0, 1.0, -1.0, -1.0], dtype=float),
+    }
+
+
+def compute_cached_base_values(w, solver_cache):
+    base_values = np.ones_like(solver_cache["next_inner_indices"], dtype=float)
+    next_inner_indices = solver_cache["next_inner_indices"]
+    border_moves = solver_cache["border_moves"]
+    for direction_index in range(4):
+        inside_mask = ~border_moves[:, direction_index]
+        base_values[inside_mask, direction_index] = (
+            w[next_inner_indices[inside_mask, direction_index]] + 1.0
+        )
+    return base_values
+
+
+def compute_cached_preferred_signs(base_values, solver_cache):
+    up_right_value = 0.5 * (base_values[:, 0] + base_values[:, 1])
+    down_left_value = 0.5 * (base_values[:, 2] + base_values[:, 3])
+
+    value_preferred_sign = np.zeros(base_values.shape[0], dtype=float)
+    value_preferred_sign[up_right_value > down_left_value] = 1.0
+    value_preferred_sign[down_left_value > up_right_value] = -1.0
+
+    preferred_signs = solver_cache["diagonal_preferred_sign"].copy()
+    tied_mask = preferred_signs == 0.0
+    preferred_signs[tied_mask] = value_preferred_sign[tied_mask]
+
+    tied_mask = preferred_signs == 0.0
+    preferred_signs[tied_mask] = solver_cache["geometry_preferred_sign"][tied_mask]
+
+    preferred_signs[solver_cache["center_suppressed"]] = 0.0
+    return preferred_signs
+
+
+def compute_cached_game_values(w, epsilon, solver_cache):
+    base_values = compute_cached_base_values(w, solver_cache)
+    preferred_signs = compute_cached_preferred_signs(base_values, solver_cache)
+    bounded_bias = compute_pvb_bounded_bias(epsilon)
+    epsilon_adjustments = (
+        bounded_bias
+        * preferred_signs[:, None]
+        * solver_cache["direction_signs"][None, :]
+    )
+    epsilon_adjustments = np.where(solver_cache["border_moves"], 0.0, epsilon_adjustments)
+    return base_values + epsilon_adjustments
+
+
+def _legacy_geometric_center_score_delta(global_index, global_n):
+    strategy_zero_score = (
+        compute_directional_safety_score(global_index, "up", global_n)
+        + compute_directional_safety_score(global_index, "right", global_n)
+    ) / 2.0
+    strategy_one_score = (
+        compute_directional_safety_score(global_index, "down", global_n)
+        + compute_directional_safety_score(global_index, "left", global_n)
+    ) / 2.0
+    return strategy_one_score - strategy_zero_score
+
+
+def compute_cached_values_and_probabilities(game_values, epsilon, global_n, solver_cache, player_temperature=None):
+    value_if_strategy_1 = 0.5 * (game_values[:, 0] + game_values[:, 1])
+    value_if_strategy_0 = 0.5 * (game_values[:, 2] + game_values[:, 3])
+
+    if epsilon <= 0.0 and player_temperature is None:
+        p1s = (value_if_strategy_1 > value_if_strategy_0).astype(float)
+        tied_mask = np.abs(value_if_strategy_1 - value_if_strategy_0) <= LEGACY_PVB_STRATEGY_TIE_TOL
+        diagonal_sign = solver_cache["diagonal_preferred_sign"]
+        p1s[tied_mask & (diagonal_sign > 0.0)] = 1.0
+        p1s[tied_mask & (diagonal_sign < 0.0)] = 0.0
+        p1s[tied_mask & (diagonal_sign == 0.0)] = 0.5
+    else:
+        effective_temperature = player_temperature
+        if effective_temperature is None:
+            effective_temperature = compute_pvb_soft_response_temperature(epsilon)
+
+        delta = (value_if_strategy_1 - value_if_strategy_0) / effective_temperature
+        delta = np.clip(delta, -60.0, 60.0)
+        p1s = 1.0 / (1.0 + np.exp(-delta))
+
+        geometry_p = 1.0 - expit(
+            DEFAULT_PVB_GEOMETRY_SCORE_SCALE
+            * epsilon
+            * solver_cache["geometric_center_score_delta"]
+        )
+        geometry_weight = compute_pvb_geometry_mix_weight(epsilon)
+        p1s = (1.0 - geometry_weight) * p1s + geometry_weight * geometry_p
+
+        value_delta = value_if_strategy_1 - value_if_strategy_0
+        ambiguity_mix = compute_pvb_ambiguity_mix(epsilon, value_delta)
+        p1s = (1.0 - ambiguity_mix) * p1s + ambiguity_mix * 0.5
+
+    values = p1s * value_if_strategy_1 + (1.0 - p1s) * value_if_strategy_0
+    return values, p1s
+
+
+def prepare_equations_cached(w, epsilon, n, inner_n, radius, border_cases, solver_cache, player_temperature=None):
+    del n, inner_n, radius, border_cases
+
+    game_values = compute_cached_game_values(w, epsilon, solver_cache)
+    values, _ = compute_cached_values_and_probabilities(
+        game_values,
+        epsilon,
+        None,
+        solver_cache,
+        player_temperature=player_temperature,
+    )
+    return tuple(w - values)
+
+
+def compute_state_values_cached(w, epsilon, n, inner_n, radius, border_cases, solver_cache, player_temperature=None):
+    del n, inner_n, radius, border_cases
+
+    game_values = compute_cached_game_values(w, epsilon, solver_cache)
+    vs, p1s = compute_cached_values_and_probabilities(
+        game_values,
+        epsilon,
+        None,
+        solver_cache,
+        player_temperature=player_temperature,
+    )
+    q1s = np.full(len(w), 0.5)
+    return p1s, q1s, vs
 
 
 def prepare_equations(w, epsilon, n, inner_n, radius, border_cases, player_temperature=None):
@@ -447,6 +684,7 @@ def solve_pvb_sweep(
     mean_times = []
     fit_scores = []
     symmetric_start = build_symmetric_legacy_start(inner_n, n)
+    solver_cache = build_pvb_solver_cache(n, inner_n, radius)
     for epsilon in tqdm(epsilon_values, desc="Solving equations"):
         message = ""
         attempts = 0
@@ -460,13 +698,14 @@ def solve_pvb_sweep(
             else:
                 starting_params = np.random.random(inner_n ** 2) * (inner_n - 2) ** 2
             w_new, _, _, message = fsolve(
-                lambda w: prepare_equations(
+                lambda w: prepare_equations_cached(
                     w,
                     epsilon,
                     n,
                     inner_n,
                     radius,
                     border_cases,
+                    solver_cache,
                     player_temperature=player_temperature,
                 ),
                 tuple(starting_params),
@@ -474,13 +713,14 @@ def solve_pvb_sweep(
             )
 
         w_new_list.append(w_new)
-        p1_flat, q1_flat, v_flat = compute_state_values(
+        p1_flat, q1_flat, v_flat = compute_state_values_cached(
             w_new,
             epsilon,
             n,
             inner_n,
             radius,
             border_cases,
+            solver_cache,
             player_temperature=player_temperature,
         )
 
