@@ -1,4 +1,5 @@
 import os
+import time
 
 import numpy as np
 import scipy.linalg
@@ -24,9 +25,11 @@ from quarter_partition_utils import (
 )
 
 
-# Legacy epsilon_border-style BvP solver is preserved below as *_legacy helpers.
+# Legacy BvP solver is preserved below as *_legacy helpers.
 
-DEFAULT_BVP_SMOOTH_ALPHA = 3.0
+DEFAULT_BVP_SMOOTH_ALPHA = 4.0
+DEFAULT_BVP_FEATURE_TAU = 0.15
+DEFAULT_BVP_BASELINE_BLEND_TAU = 0.03
 
 
 def find_max(func, game):
@@ -76,7 +79,7 @@ def make_banded_matrix(A, N):
     return banded_matrix
 
 
-def _legacy_compute_epsilon_border(inner_index, epsilon, direction, radius, global_n, inner_n):
+def _legacy_compute_direction_bias(inner_index, epsilon, direction, radius, global_n, inner_n):
     global_index = inner_n_to_global_N(inner_index, inner_n, global_n)
     cur_distance = compute_distance_to_center(global_index, global_n)
     distance_to_border = compute_distance_to_border(global_index, global_n)
@@ -104,7 +107,7 @@ def _legacy_compute_a11(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "up", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_direction_bias(next_inner_index, epsilon, "up", radius, n, inner_n)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -112,7 +115,7 @@ def _legacy_compute_a21(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + n) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + n, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "down", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_direction_bias(next_inner_index, epsilon, "down", radius, n, inner_n)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -120,7 +123,7 @@ def _legacy_compute_a12(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index + 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index + 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "right", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_direction_bias(next_inner_index, epsilon, "right", radius, n, inner_n)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -128,7 +131,7 @@ def _legacy_compute_a22(index, w, epsilon, radius, n, inner_n, border_cases):
     if (index - 1) in border_cases:
         return 1.0
     next_inner_index = global_N_to_inner_n(index - 1, inner_n, n)
-    adjusted_epsilon = _legacy_compute_epsilon_border(next_inner_index, epsilon, "left", radius, n, inner_n)
+    adjusted_epsilon = _legacy_compute_direction_bias(next_inner_index, epsilon, "left", radius, n, inner_n)
     return w[next_inner_index] + 1.0 + adjusted_epsilon
 
 
@@ -177,8 +180,11 @@ def solve_bvp_quarter_sweep_legacy(
     w_new_list = []
     strategy_snapshots = []
     mean_times = []
+    solve_times = []
+    attempt_counts = []
 
     for epsilon in tqdm(epsilon_values, desc="Solving legacy BvP equations"):
+        started_at = time.perf_counter()
         message = ""
         attempts = 0
         while message != "The solution converged.":
@@ -194,11 +200,14 @@ def solve_bvp_quarter_sweep_legacy(
             )
 
         w_new_list.append(w_new)
+        attempt_counts.append(attempts)
+        solve_times.append(time.perf_counter() - started_at)
         p1_flat, q1_flat, v_flat = _legacy_compute_state_values(w_new, epsilon, n, inner_n, radius, border_cases)
         qr_optimal, probability_optimal = make_prob_matrix(
             N,
             np.pad(np.reshape(p1_flat, (inner_n, inner_n)), pad_width=1, mode="constant", constant_values=0).T,
-            np.pad(np.reshape(q1_flat, (inner_n, inner_n)), pad_width=1, mode="constant", constant_values=0).T,
+            1.0
+            - np.pad(np.reshape(q1_flat, (inner_n, inner_n)), pad_width=1, mode="constant", constant_values=0).T,
         )
         mean_time, _ = find_mean_time_banded(probability_optimal, N - 1)
         mean_times.append(mean_time)
@@ -219,6 +228,18 @@ def solve_bvp_quarter_sweep_legacy(
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
 
+    with open(output_duration + "absorption_time.txt", "w") as file:
+        for mean_time in mean_times:
+            file.write(f"{mean_time} ")
+
+    with open(output_duration + "solve_times.txt", "w") as file:
+        for solve_time in solve_times:
+            file.write(f"{solve_time} ")
+
+    with open(output_duration + "attempt_counts.txt", "w") as file:
+        for attempts in attempt_counts:
+            file.write(f"{attempts} ")
+
     return {
         "n": n,
         "N": N,
@@ -228,6 +249,8 @@ def solve_bvp_quarter_sweep_legacy(
         "w_new_list": w_new_list,
         "strategy_snapshots": strategy_snapshots,
         "mean_times": np.array(mean_times, dtype=float),
+        "solve_times": np.array(solve_times, dtype=float),
+        "attempt_counts": np.array(attempt_counts, dtype=int),
         "mode": "quarter-border-legacy",
     }
 
@@ -239,32 +262,76 @@ def is_border_state(global_index, global_n):
 
 def compute_border_direction_score(global_index, direction, global_n):
     next_global_index = move_global_index(global_index, global_n, direction)
-    preferred = preferred_border_directions(global_index, global_n)
-    alignment = 1.0 if direction in preferred else -1.0
-
-    if is_border_state(next_global_index, global_n):
-        return 2.5 + 0.75 * alignment
-    if not is_inner_state(next_global_index, global_n):
-        return -2.5
+    if not is_inner_state(next_global_index, global_n) and not is_border_state(next_global_index, global_n):
+        return -1.0
 
     current_border_distance = compute_distance_to_border(global_index, global_n)
     next_border_distance = compute_distance_to_border(next_global_index, global_n)
-    current_center_distance = compute_distance_to_center(global_index, global_n)
-    next_center_distance = compute_distance_to_center(next_global_index, global_n)
+    return current_border_distance - next_border_distance
 
-    border_gain = current_border_distance - next_border_distance
-    center_gain = next_center_distance - current_center_distance
-    return 0.7 * alignment + 0.9 * border_gain + 0.1 * center_gain
+
+def compute_border_axis_score(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    center = global_n // 2
+
+    top = float(row)
+    bottom = float(global_n - 1 - row)
+    left = float(col)
+    right = float(global_n - 1 - col)
+    nearest_vertical = min(top, bottom)
+    nearest_horizontal = min(left, right)
+
+    axis_min = 1.0 / (nearest_vertical + 1.0) - 1.0 / (nearest_horizontal + 1.0)
+    axis_sum = 1.0 / (top + 1.0) + 1.0 / (bottom + 1.0) - 1.0 / (left + 1.0) - 1.0 / (right + 1.0)
+    center_row = np.exp(-((row - center) / 2.0) ** 2)
+    center_col = -np.exp(-((col - center) / 2.0) ** 2)
+    near_top_bottom = np.exp(-nearest_vertical / 2.0)
+    near_left_right = -np.exp(-nearest_horizontal / 2.0)
+    diagonal_balance = (abs(row - center) - abs(col - center)) / max(1.0, global_n / 2.0)
+
+    # Coefficients were selected on geometry-only features so the map is no longer a
+    # hard quarter template, but every term still depends on nearest-border geometry.
+    return (
+        -0.056
+        + 0.358 * axis_min
+        + 0.644 * axis_sum
+        + 0.259 * center_row
+        + 0.310 * center_col
+        + 0.553 * near_top_bottom
+        + 0.441 * near_left_right
+        - 0.789 * diagonal_balance
+    )
+
+
+def compute_border_baseline_probability(global_index, global_n):
+    row, col = get_row_col(global_index, global_n)
+    center = global_n // 2
+    vertical_offset = abs(row - center)
+    horizontal_offset = abs(col - center)
+
+    if vertical_offset > horizontal_offset:
+        return 1.0
+    if horizontal_offset > vertical_offset:
+        return 0.0
+    return 0.5
+
+
+def compute_border_probability_vertical(global_index, epsilon, global_n, smooth_alpha=DEFAULT_BVP_SMOOTH_ALPHA):
+    baseline_probability = compute_border_baseline_probability(global_index, global_n)
+    if epsilon <= 0.0:
+        return baseline_probability
+
+    # Keep epsilon=0 as the exact quarter baseline, but avoid the old fast
+    # exponential saturation where most positive epsilons produced almost the
+    # same strategy map.
+    activation = smooth_alpha * float(epsilon)
+    feature_probability = float(expit(activation * compute_border_axis_score(global_index, global_n)))
+    blend_weight = 1.0 - np.exp(-float(epsilon) / DEFAULT_BVP_BASELINE_BLEND_TAU)
+    return float((1.0 - blend_weight) * baseline_probability + blend_weight * feature_probability)
 
 
 def compute_border_probability_horizontal(global_index, epsilon, global_n, smooth_alpha=DEFAULT_BVP_SMOOTH_ALPHA):
-    score_vertical = np.mean(
-        [compute_border_direction_score(global_index, direction, global_n) for direction in PURE_BORDER_VERTICAL]
-    )
-    score_horizontal = np.mean(
-        [compute_border_direction_score(global_index, direction, global_n) for direction in PURE_BORDER_HORIZONTAL]
-    )
-    return expit(smooth_alpha * epsilon * (score_horizontal - score_vertical))
+    return compute_border_probability_vertical(global_index, epsilon, global_n, smooth_alpha=smooth_alpha)
 
 
 def build_border_strategy(global_n, epsilon, smooth_alpha=DEFAULT_BVP_SMOOTH_ALPHA):
@@ -272,7 +339,7 @@ def build_border_strategy(global_n, epsilon, smooth_alpha=DEFAULT_BVP_SMOOTH_ALP
     for row in range(1, global_n - 1):
         for col in range(1, global_n - 1):
             global_index = row * global_n + col
-            strategy_border[row, col] = compute_border_probability_horizontal(
+            strategy_border[row, col] = compute_border_probability_vertical(
                 global_index,
                 epsilon,
                 global_n,
@@ -282,7 +349,10 @@ def build_border_strategy(global_n, epsilon, smooth_alpha=DEFAULT_BVP_SMOOTH_ALP
 
 
 def compute_duration_distribution_from_strategies(N, strategy_center, strategy_border, num_steps=999):
-    qr, probability_optimal = make_prob_matrix(N, strategy_center, strategy_border)
+    # strategy_border is stored and plotted canonically as P(up/down).
+    # make_prob_matrix expects P(right/left), so convert only at the transition
+    # layer. This keeps the images readable while preserving game semantics.
+    qr, probability_optimal = make_prob_matrix(N, strategy_center, 1.0 - strategy_border)
     _, prob, _ = model_pvp(N, qr, num_steps=num_steps)
     prob = np.asarray(prob, dtype=float)
     if prob.sum() > 0:
@@ -355,6 +425,10 @@ def solve_bvp_quarter_sweep(
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
 
+    with open(output_duration + "absorption_time.txt", "w") as file:
+        for mean_time in mean_times:
+            file.write(f"{mean_time} ")
+
     if real_pmf is not None:
         with open(output_duration + "jsd.txt", "w") as file:
             for score in fit_scores:
@@ -373,3 +447,25 @@ def solve_bvp_quarter_sweep(
         "smooth_alpha": float(smooth_alpha),
         "mode": "quarter-border-smooth",
     }
+
+
+def solve_bvp_sweep(
+    n,
+    epsilon_values,
+    output_duration,
+    output_absorption_images1,
+    output_absorption_images2,
+    output_absorption_images3,
+    qr_matrices,
+    **kwargs,
+):
+    return solve_bvp_quarter_sweep(
+        epsilon_values=epsilon_values,
+        output_duration=output_duration,
+        output_absorption_images1=output_absorption_images1,
+        output_absorption_images2=output_absorption_images2,
+        output_absorption_images3=output_absorption_images3,
+        qr_matrices=qr_matrices,
+        n=n,
+        **kwargs,
+    )

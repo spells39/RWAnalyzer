@@ -6,8 +6,6 @@ from tqdm import tqdm
 from make_prob_matrix import make_prob_matrix
 from model_pvp import model_pvp
 from quarter_partition_utils import (
-    PURE_CENTER_DL,
-    PURE_CENTER_UR,
     compute_distance_to_border,
     compute_distance_to_center,
     ensure_output_dirs,
@@ -16,6 +14,16 @@ from quarter_partition_utils import (
     move_global_index,
     preferred_center_directions,
 )
+
+DEFAULT_PVB_FEATURE_SCALE = 4.0
+DEFAULT_PVB_FEATURE_TAU = 0.40
+DEFAULT_PVB_FEATURE_POWER = 0.75
+DEFAULT_PVB_BASELINE_BLEND_TAU = 0.05
+DEFAULT_PVB_DIAGONAL_WEIGHT = 1.5
+DEFAULT_PVB_SAFETY_WEIGHT = 0.5
+DEFAULT_PVB_EDGE_WEIGHT = 2.0
+DEFAULT_PVB_AMBIGUITY_MIX = 0.2
+DEFAULT_PVB_DIAGONAL_POWER = 1.5
 
 
 def compute_center_direction_score(global_index, direction, global_n):
@@ -31,10 +39,70 @@ def compute_center_direction_score(global_index, direction, global_n):
     return 0.9 * alignment + 0.35 * border_delta + 0.10 * center_delta
 
 
+def compute_transition_safety_score(row, col, global_n):
+    center = global_n // 2
+    border_score = min(row, global_n - 1 - row, col, global_n - 1 - col) / max(1.0, global_n // 2)
+    center_score = 1.0 - (abs(row - center) + abs(col - center)) / max(1.0, global_n - 2)
+    return 0.75 * border_score + 0.25 * center_score
+
+
+def compute_center_strategy_score(global_index, global_n):
+    row, col = divmod(global_index, global_n)
+    center = global_n // 2
+    inner_n = global_n - 2
+
+    diagonal_distance = abs(row - col) / max(1.0, inner_n)
+    diagonal_score = np.sign(row - col) * (diagonal_distance ** DEFAULT_PVB_DIAGONAL_POWER)
+
+    up_score = compute_transition_safety_score(max(1, row - 1), col, global_n)
+    right_score = compute_transition_safety_score(row, min(global_n - 2, col + 1), global_n)
+    down_score = compute_transition_safety_score(min(global_n - 2, row + 1), col, global_n)
+    left_score = compute_transition_safety_score(row, max(1, col - 1), global_n)
+    safety_delta = 0.5 * (up_score + right_score) - 0.5 * (down_score + left_score)
+
+    edge_score = (
+        1.0 / (row + 1.0)
+        + 1.0 / (global_n - col)
+        - 1.0 / (global_n - row)
+        - 1.0 / (col + 1.0)
+    )
+
+    return (
+        DEFAULT_PVB_DIAGONAL_WEIGHT * diagonal_score
+        + DEFAULT_PVB_SAFETY_WEIGHT * safety_delta
+        + DEFAULT_PVB_EDGE_WEIGHT * edge_score
+    )
+
+
+def compute_center_baseline_probability_up_right(global_index, global_n):
+    row, col = divmod(global_index, global_n)
+    if row > col:
+        return 1.0
+    if row < col:
+        return 0.0
+    return 0.5
+
+
+def compute_center_probability_up_right(global_index, epsilon, global_n):
+    baseline_probability = compute_center_baseline_probability_up_right(global_index, global_n)
+    score = compute_center_strategy_score(global_index, global_n)
+    if epsilon <= 0.0:
+        return baseline_probability
+
+    normalized_epsilon = (float(epsilon) / DEFAULT_PVB_FEATURE_TAU) ** DEFAULT_PVB_FEATURE_POWER
+    activation = DEFAULT_PVB_FEATURE_SCALE * np.tanh(normalized_epsilon)
+    probability = float(expit(activation * score))
+
+    # Near a strategy tie the empirical maps are softer, so keep a small ambiguity
+    # mixture that decays as epsilon becomes informative.
+    ambiguity = DEFAULT_PVB_AMBIGUITY_MIX * np.exp(-abs(score) / 0.08) * np.exp(-float(epsilon) / 0.5)
+    feature_probability = float((1.0 - ambiguity) * probability + ambiguity * 0.5)
+    blend_weight = 1.0 - np.exp(-float(epsilon) / DEFAULT_PVB_BASELINE_BLEND_TAU)
+    return float((1.0 - blend_weight) * baseline_probability + blend_weight * feature_probability)
+
+
 def compute_center_probability_dl(global_index, epsilon, global_n):
-    score_ur = np.mean([compute_center_direction_score(global_index, direction, global_n) for direction in PURE_CENTER_UR])
-    score_dl = np.mean([compute_center_direction_score(global_index, direction, global_n) for direction in PURE_CENTER_DL])
-    return expit(epsilon * (score_dl - score_ur))
+    return compute_center_probability_up_right(global_index, epsilon, global_n)
 
 
 def build_center_strategy(global_n, epsilon):
@@ -42,12 +110,14 @@ def build_center_strategy(global_n, epsilon):
     for row in range(1, global_n - 1):
         for col in range(1, global_n - 1):
             global_index = row * global_n + col
-            strategy_center[row, col] = compute_center_probability_dl(global_index, epsilon, global_n)
+            strategy_center[row, col] = compute_center_probability_up_right(global_index, epsilon, global_n)
     return strategy_center
 
 
 def compute_duration_distribution_from_strategies(N, strategy_center, strategy_border, num_steps=999):
-    qr, probability_optimal = make_prob_matrix(N, strategy_center, strategy_border)
+    # strategy_center is stored and plotted canonically as P(up/right).
+    # make_prob_matrix expects P(down/left), so convert only at the transition layer.
+    qr, probability_optimal = make_prob_matrix(N, 1.0 - strategy_center, strategy_border)
     _, prob, _ = model_pvp(N, qr, num_steps=num_steps)
     prob = np.asarray(prob, dtype=float)
     if prob.sum() > 0:
@@ -117,6 +187,10 @@ def solve_pvb_quarter_sweep(
         )
 
     with open(output_duration + "duration.txt", "w") as file:
+        for mean_time in mean_times:
+            file.write(f"{mean_time} ")
+
+    with open(output_duration + "absorption_time.txt", "w") as file:
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
 

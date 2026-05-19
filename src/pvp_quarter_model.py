@@ -9,7 +9,9 @@ from quarter_partition_utils import ensure_output_dirs, find_mean_time_banded
 
 
 def compute_duration_distribution_from_strategies(N, strategy_center, strategy_border, num_steps=9999):
-    qr, probability_optimal = make_prob_matrix(N, strategy_center, strategy_border)
+    # build_center_strategy returns the plotted canonical P(up/right).
+    # make_prob_matrix expects P(down/left), so convert only for simulation.
+    qr, probability_optimal = make_prob_matrix(N, 1.0 - strategy_center, strategy_border)
     _, prob, _ = model_pvp(N, qr, num_steps=num_steps)
     prob = np.asarray(prob, dtype=float)
     if prob.sum() > 0:
@@ -83,6 +85,10 @@ def solve_pvp_quarter_center_sweep(
         )
 
     with open(output_duration + "duration.txt", "w") as file:
+        for mean_time in mean_times:
+            file.write(f"{mean_time} ")
+
+    with open(output_duration + "absorption_time.txt", "w") as file:
         for mean_time in mean_times:
             file.write(f"{mean_time} ")
 
