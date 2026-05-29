@@ -141,7 +141,8 @@ def plot_real_center_strategy_from_npy(
     output_path="../output/real_center_strategy_pve.png",
     title="Вероятность игрока \"за центр\" выбрать 1 стратегию (PVE).",
 ):
-    strategy_matrix = np.load(strategy_path)
+    strategy_matrix = np.load(strategy_path).copy()
+    strategy_matrix[1:-1, 1:-1] = 1.0 - strategy_matrix[1:-1, 1:-1]
     plot_center_strategy_matrix(
         strategy_matrix=strategy_matrix,
         output_path=output_path,

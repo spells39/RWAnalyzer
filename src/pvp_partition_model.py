@@ -1,13 +1,15 @@
 import os
+import tempfile
 
 import numpy as np
 import scipy.linalg
 from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 
+from bvp_partition_model import solve_bvp_sweep_legacy
 from make_prob_matrix import make_prob_matrix
 from model_pvp import model_pvp
-from pvb_partition_model import build_geometric_center_strategy
+from pvb_partition_model import solve_pvb_sweep
 
 
 def make_banded_matrix(A, N):
@@ -36,40 +38,167 @@ def ensure_output_dirs(output_absorption_images1, output_absorption_images2, out
     os.makedirs(qr_matrices, exist_ok=True)
 
 
-def compute_duration_distribution_from_strategies(N, strategy_center, strategy_border, num_steps=9999):
-    qr, probability_optimal = make_prob_matrix(N, strategy_center, strategy_border)
-    _, prob, _ = model_pvp(N, qr, num_steps=num_steps)
-    prob = np.asarray(prob, dtype=float)
-    if prob.sum() > 0:
-        prob /= prob.sum()
-    return qr, probability_optimal, prob
+def _component_paths(output_duration, component_name):
+    root = os.path.join(output_duration, "components", component_name)
+    return {
+        "output_duration": root + os.sep,
+        "output_absorption_images1": os.path.join(root, "absorption_times") + os.sep,
+        "output_absorption_images2": os.path.join(root, "center_strategies") + os.sep,
+        "output_absorption_images3": os.path.join(root, "border_strategies") + os.sep,
+        "qr_matrices": os.path.join(root, "qr") + os.sep,
+    }
 
 
-def solve_pvp_geometric_center_sweep(
+def _build_combined_transition_matrix(N, inner_n, center_snapshot, border_snapshot):
+    center_up_right = np.reshape(center_snapshot["p1s"], (inner_n, inner_n))
+    border_vertical = np.reshape(border_snapshot["q1s"], (inner_n, inner_n))
+
+    strategy_center_for_matrix = np.pad(
+        1.0 - center_up_right,
+        pad_width=1,
+        mode="constant",
+        constant_values=0,
+    )
+    strategy_border_for_matrix = np.pad(
+        border_vertical,
+        pad_width=1,
+        mode="constant",
+        constant_values=0,
+    ).T
+    return make_prob_matrix(N, strategy_center_for_matrix, strategy_border_for_matrix)
+
+
+def compute_pvp_movement_diagnostics(qr, N):
+    inner_n = N - 1
+    expected_col_step = np.zeros((inner_n, inner_n), dtype=float)
+    expected_row_step = np.zeros((inner_n, inner_n), dtype=float)
+    border_progress = np.zeros((inner_n, inner_n), dtype=float)
+
+    for row in range(1, N):
+        for col in range(1, N):
+            source_index = (N + 1) * row + col
+            probabilities = {
+                (-1, 0): qr[source_index, (N + 1) * (row - 1) + col],
+                (1, 0): qr[source_index, (N + 1) * (row + 1) + col],
+                (0, -1): qr[source_index, (N + 1) * row + col - 1],
+                (0, 1): qr[source_index, (N + 1) * row + col + 1],
+            }
+            target_row = row - 1
+            target_col = col - 1
+            current_border_distance = min(row, col, N - row, N - col)
+            expected_distance = 0.0
+            for (row_step, col_step), probability in probabilities.items():
+                expected_row_step[target_row, target_col] += probability * row_step
+                expected_col_step[target_row, target_col] += probability * col_step
+                next_row = row + row_step
+                next_col = col + col_step
+                expected_distance += probability * min(
+                    next_row,
+                    next_col,
+                    N - next_row,
+                    N - next_col,
+                )
+            border_progress[target_row, target_col] = current_border_distance - expected_distance
+
+    transient_indices = [
+        (N + 1) * row + col
+        for row in range(1, N)
+        for col in range(1, N)
+    ]
+    transient_matrix = qr[np.ix_(transient_indices, transient_indices)]
+    initial_state = np.zeros(inner_n ** 2, dtype=float)
+    initial_state[(inner_n // 2) * inner_n + inner_n // 2] = 1.0
+    expected_visits = scipy.linalg.solve(
+        np.eye(transient_matrix.shape[0]) - transient_matrix.T,
+        initial_state,
+    ).reshape((inner_n, inner_n))
+    visit_share = expected_visits / expected_visits.sum()
+
+    return {
+        "expected_col_step": expected_col_step,
+        "expected_row_step": expected_row_step,
+        "border_progress": border_progress,
+        "expected_visits": expected_visits,
+        "visit_share": visit_share,
+    }
+
+
+def sample_pvp_trajectory(qr, N, max_steps=10000, random_seed=None):
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive.")
+
+    rng = np.random.default_rng(random_seed)
+    current_row = N // 2
+    current_col = N // 2
+    trajectory = [(current_row, current_col)]
+
+    for _ in range(max_steps):
+        if current_row in (0, N) or current_col in (0, N):
+            return np.asarray(trajectory, dtype=int), True
+
+        state_index = (N + 1) * current_row + current_col
+        probabilities = np.asarray(qr[state_index], dtype=float)
+        total_probability = probabilities.sum()
+        if not np.isclose(total_probability, 1.0):
+            if total_probability <= 0.0:
+                raise RuntimeError("No outgoing transition is available for the current state.")
+            probabilities = probabilities / total_probability
+
+        next_index = int(rng.choice(qr.shape[1], p=probabilities))
+        current_row, current_col = divmod(next_index, N + 1)
+        trajectory.append((current_row, current_col))
+
+    absorbed = current_row in (0, N) or current_col in (0, N)
+    return np.asarray(trajectory, dtype=int), absorbed
+
+
+def solve_pvp_combined_sweep(
+    n,
     epsilon_values,
-    strategy_border_path,
     output_duration,
     output_absorption_images1,
     output_absorption_images2,
     output_absorption_images3,
     qr_matrices,
     real_pmf_path=None,
-    num_steps=9999,
+    num_steps=999,
+    max_attempts=100,
+    save_component_outputs=False,
 ):
-    strategy_border = np.load(strategy_border_path).astype(float)
-
-    if strategy_border.shape[0] != strategy_border.shape[1]:
-        raise ValueError("Border strategy must be a square matrix.")
-
-    N = strategy_border.shape[0] - 1
-    inner_n = N - 1
-    n = N + 1
-
+    N = n - 1
+    inner_n = n - 2
+    epsilon_values = np.asarray(epsilon_values, dtype=float)
+    if np.any(epsilon_values <= 0.0):
+        raise ValueError(
+            "Combined PvP requires epsilon > 0: at epsilon=0 the two pure "
+            "baseline policies can form a non-absorbing cycle."
+        )
     ensure_output_dirs(output_absorption_images1, output_absorption_images2, output_absorption_images3, qr_matrices)
 
-    with open(output_duration + "epsilon_values.txt", "w") as file:
-        for value in epsilon_values:
-            file.write(f"{value:.3f}\n")
+    if save_component_outputs:
+        component_workspace = output_duration
+        cleanup_workspace = None
+    else:
+        cleanup_workspace = tempfile.TemporaryDirectory(prefix="_pvp_components_", dir=output_duration)
+        component_workspace = cleanup_workspace.name + os.sep
+    try:
+        center_result = solve_pvb_sweep(
+            n=n,
+            epsilon_values=epsilon_values,
+            real_pmf_path=None,
+            num_steps=num_steps,
+            max_attempts=max_attempts,
+            **_component_paths(component_workspace, "pvb_center"),
+        )
+        border_result = solve_bvp_sweep_legacy(
+            n=n,
+            epsilon_values=epsilon_values,
+            max_attempts=max_attempts,
+            **_component_paths(component_workspace, "bvp_border"),
+        )
+    finally:
+        if cleanup_workspace is not None:
+            cleanup_workspace.cleanup()
 
     real_pmf = None
     if real_pmf_path is not None:
@@ -77,37 +206,48 @@ def solve_pvp_geometric_center_sweep(
         if real_pmf.sum() > 0:
             real_pmf /= real_pmf.sum()
 
+    with open(output_duration + "epsilon_values.txt", "w") as file:
+        for value in epsilon_values:
+            file.write(f"{value:.3f}\n")
+
     strategy_snapshots = []
     mean_times = []
     fit_scores = []
-
-    for epsilon in tqdm(epsilon_values, desc="Building geometric PvP center strategy"):
-        strategy_center = build_geometric_center_strategy(n, epsilon)
-        qr_optimal, probability_optimal, prob = compute_duration_distribution_from_strategies(
+    for epsilon, center_snapshot, border_snapshot in tqdm(
+        zip(epsilon_values, center_result["strategy_snapshots"], border_result["strategy_snapshots"]),
+        total=len(epsilon_values),
+        desc="Combining PvB and BvP policies",
+    ):
+        qr_optimal, probability_optimal = _build_combined_transition_matrix(
             N,
-            strategy_center,
-            strategy_border,
-            num_steps=num_steps,
+            inner_n,
+            center_snapshot,
+            border_snapshot,
         )
-        np.save(qr_matrices + f"qr_{epsilon:.2f}", qr_optimal)
-
         mean_time, state_mean_times = find_mean_time_banded(probability_optimal, N - 1)
+        movement_diagnostics = compute_pvp_movement_diagnostics(qr_optimal, N)
         mean_times.append(mean_time)
+        np.save(qr_matrices + f"qr_{epsilon:.2f}", qr_optimal)
 
         fit_score = None
         if real_pmf is not None:
+            _, prob, _ = model_pvp(N, qr_optimal, num_steps=num_steps)
+            prob = np.asarray(prob, dtype=float)
+            if prob.sum() > 0:
+                prob /= prob.sum()
             fit_score = float(jensenshannon(real_pmf, prob))
         fit_scores.append(fit_score)
 
         strategy_snapshots.append(
             {
                 "epsilon": float(epsilon),
-                "p1s": strategy_center[1:-1, 1:-1].reshape(inner_n ** 2),
-                "q1s": strategy_border[1:-1, 1:-1].reshape(inner_n ** 2),
+                "p1s": center_snapshot["p1s"],
+                "q1s": border_snapshot["q1s"],
                 "vs": state_mean_times,
                 "w": None,
                 "mean_time": float(mean_time),
                 "jsd": fit_score,
+                **movement_diagnostics,
             }
         )
 
@@ -124,11 +264,13 @@ def solve_pvp_geometric_center_sweep(
         "n": n,
         "N": N,
         "inner_n": inner_n,
-        "epsilon_values": np.array(epsilon_values, dtype=float),
+        "epsilon_values": epsilon_values,
         "w_new_list": [],
         "strategy_snapshots": strategy_snapshots,
-        "mean_times": np.array(mean_times, dtype=float),
+        "mean_times": np.asarray(mean_times, dtype=float),
         "fit_scores": fit_scores,
-        "strategy_border": strategy_border,
-        "mode": "geometric-center",
+        "center_result": center_result,
+        "border_result": border_result,
+        "mode": "combined-pvb-center-vs-bvp-border",
+        "component_outputs_saved": bool(save_component_outputs),
     }

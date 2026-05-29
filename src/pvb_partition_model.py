@@ -16,15 +16,23 @@ LEGACY_PVB_STRATEGY_TIE_TOL = 1e-3
 DEFAULT_PVB_BOUNDED_BIAS_SCALE = 0.46
 DEFAULT_PVB_BOUNDED_BIAS_TAU = 0.30
 DEFAULT_PVB_BOUNDED_BIAS_POWER = 0.75
-DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE = 0.15
-DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE = 0.70
-DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_TAU = 0.50
-DEFAULT_PVB_AMBIGUITY_MIX_SCALE = 0.72
+DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE = 0.01
+DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE = 10.0
+DEFAULT_PVB_AMBIGUITY_MIX_SCALE = 0.36
 DEFAULT_PVB_AMBIGUITY_MIX_RISE = 0.28
 DEFAULT_PVB_AMBIGUITY_SCALE = 0.30
-DEFAULT_PVB_GEOMETRY_MIX_SCALE = 0.10
+DEFAULT_PVB_GEOMETRY_MIX_SCALE = 0.05
 DEFAULT_PVB_GEOMETRY_MIX_RISE = 0.28
 DEFAULT_PVB_GEOMETRY_SCORE_SCALE = 0.75
+DEFAULT_PVB_BEHAVIOR_MIX_SCALE = 0.60
+DEFAULT_PVB_BEHAVIOR_MIX_RISE = 0.08
+DEFAULT_PVB_BEHAVIOR_LOGIT_SCALE = 0.8
+DEFAULT_PVB_BEHAVIOR_SEED = 20260526
+DEFAULT_PVB_BEHAVIOR_SECONDARY_SEED = 20260527
+DEFAULT_PVB_BEHAVIOR_ROTATION_RATE = 2.0
+DEFAULT_PVB_ZERO_GAME_RELEASE_TAU = 0.015
+DEFAULT_PVB_SOLVER_RANDOM_SEED = 20260526
+DEFAULT_PVB_SOLVER_RESIDUAL_TOL = 1e-7
 
 
 def compute_pvb_bounded_bias(epsilon):
@@ -38,9 +46,10 @@ def compute_pvb_soft_response_temperature(epsilon):
     if epsilon <= 0.0:
         return None
     return float(
-        DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE
-        + DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE
-        * np.exp(-float(epsilon) / DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_TAU)
+        max(
+            DEFAULT_PVB_SOFT_RESPONSE_MIN_TEMPERATURE,
+            DEFAULT_PVB_SOFT_RESPONSE_TEMPERATURE_SCALE * float(epsilon),
+        )
     )
 
 
@@ -61,6 +70,30 @@ def compute_pvb_ambiguity_mix(epsilon, value_delta):
     )
     ambiguity = np.exp(-np.abs(value_delta) / DEFAULT_PVB_AMBIGUITY_SCALE)
     return epsilon_weight * ambiguity
+
+
+def compute_pvb_behavior_mix_weight(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    return float(
+        DEFAULT_PVB_BEHAVIOR_MIX_SCALE
+        * (1.0 - np.exp(-float(epsilon) / DEFAULT_PVB_BEHAVIOR_MIX_RISE))
+    )
+
+
+def compute_pvb_zero_game_release_weight(epsilon):
+    if epsilon <= 0.0:
+        return 0.0
+    return float(1.0 - np.exp(-float(epsilon) / DEFAULT_PVB_ZERO_GAME_RELEASE_TAU))
+
+
+def compute_pvb_behavioral_preference(epsilon, solver_cache):
+    phase = DEFAULT_PVB_BEHAVIOR_ROTATION_RATE * float(epsilon)
+    latent = DEFAULT_PVB_BEHAVIOR_LOGIT_SCALE * (
+        np.cos(phase) * solver_cache["behavior_primary_latent"]
+        + np.sin(phase) * solver_cache["behavior_secondary_latent"]
+    )
+    return expit(latent)
 
 
 def inner_n_to_global_N(index, inner_n, global_n):
@@ -215,6 +248,16 @@ def build_pvb_solver_cache(n, inner_n, radius):
     geometry_preferred_sign = np.zeros(state_count, dtype=float)
     center_suppressed = np.zeros(state_count, dtype=bool)
     geometric_center_score_delta = np.zeros(state_count, dtype=float)
+    behavior_primary_rng = np.random.default_rng(DEFAULT_PVB_BEHAVIOR_SEED)
+    behavior_secondary_rng = np.random.default_rng(DEFAULT_PVB_BEHAVIOR_SECONDARY_SEED)
+    behavior_primary_latent = behavior_primary_rng.standard_normal(state_count)
+    behavior_secondary_latent = behavior_secondary_rng.standard_normal(state_count)
+    behavior_primary_latent = (
+        behavior_primary_latent - behavior_primary_latent.mean()
+    ) / behavior_primary_latent.std()
+    behavior_secondary_latent = (
+        behavior_secondary_latent - behavior_secondary_latent.mean()
+    ) / behavior_secondary_latent.std()
 
     # Direction order: up, right, down, left. This matches the local game layout.
     offsets = np.array([-n, 1, n, -1], dtype=np.int64)
@@ -253,6 +296,8 @@ def build_pvb_solver_cache(n, inner_n, radius):
         "geometry_preferred_sign": geometry_preferred_sign,
         "center_suppressed": center_suppressed,
         "geometric_center_score_delta": geometric_center_score_delta,
+        "behavior_primary_latent": behavior_primary_latent,
+        "behavior_secondary_latent": behavior_secondary_latent,
         "direction_signs": np.array([1.0, 1.0, -1.0, -1.0], dtype=float),
     }
 
@@ -344,6 +389,22 @@ def compute_cached_values_and_probabilities(game_values, epsilon, global_n, solv
         value_delta = value_if_strategy_1 - value_if_strategy_0
         ambiguity_mix = compute_pvb_ambiguity_mix(epsilon, value_delta)
         p1s = (1.0 - ambiguity_mix) * p1s + ambiguity_mix * 0.5
+
+        behavior_weight = compute_pvb_behavior_mix_weight(epsilon)
+        behavioral_preference = compute_pvb_behavioral_preference(epsilon, solver_cache)
+        p1s = (
+            (1.0 - behavior_weight) * p1s
+            + behavior_weight * behavioral_preference
+        )
+
+        diagonal_sign = solver_cache["diagonal_preferred_sign"]
+        zero_game_p1s = np.where(
+            diagonal_sign > 0.0,
+            1.0,
+            np.where(diagonal_sign < 0.0, 0.0, 0.5),
+        )
+        release_weight = compute_pvb_zero_game_release_weight(epsilon)
+        p1s = (1.0 - release_weight) * zero_game_p1s + release_weight * p1s
 
     values = p1s * value_if_strategy_1 + (1.0 - p1s) * value_if_strategy_0
     return values, p1s
@@ -492,19 +553,27 @@ def solve_pvb_sweep(
     fit_scores = []
     symmetric_start = build_symmetric_legacy_start(inner_n, n)
     solver_cache = build_pvb_solver_cache(n, inner_n, radius)
+    previous_solution = None
+    retry_rng = np.random.default_rng(DEFAULT_PVB_SOLVER_RANDOM_SEED)
     for epsilon in tqdm(epsilon_values, desc="Solving equations"):
-        message = ""
         attempts = 0
-        while message != "The solution converged.":
+        message = ""
+        residual = np.inf
+        while True:
             attempts += 1
             if attempts > max_attempts:
-                raise RuntimeError(f"Failed to converge for epsilon={epsilon:.3f}: {message}")
+                raise RuntimeError(
+                    f"Failed to converge for epsilon={epsilon:.3f}: "
+                    f"{message}; residual={residual:.3e}"
+                )
 
-            if attempts == 1:
+            if attempts == 1 and previous_solution is not None:
+                starting_params = previous_solution
+            elif attempts == 1:
                 starting_params = symmetric_start
             else:
-                starting_params = np.random.random(inner_n ** 2) * (inner_n - 2) ** 2
-            w_new, _, _, message = fsolve(
+                starting_params = retry_rng.random(inner_n ** 2) * (inner_n - 2) ** 2
+            w_new, info, ier, message = fsolve(
                 lambda w: prepare_equations_cached(
                     w,
                     epsilon,
@@ -518,7 +587,11 @@ def solve_pvb_sweep(
                 tuple(starting_params),
                 full_output=True,
             )
+            residual = float(np.max(np.abs(info["fvec"])))
+            if ier == 1 and residual <= DEFAULT_PVB_SOLVER_RESIDUAL_TOL:
+                break
 
+        previous_solution = w_new
         w_new_list.append(w_new)
         p1_flat, q1_flat, v_flat = compute_state_values_cached(
             w_new,
@@ -534,10 +607,24 @@ def solve_pvb_sweep(
         p1_matrix = np.reshape(p1_flat, (inner_n, inner_n))
         q1_matrix = np.reshape(q1_flat, (inner_n, inner_n))
 
+        # Internally p1 is P(up/right), while make_prob_matrix expects
+        # P(down/left) for the center player.
+        strategy_center_for_matrix = np.pad(
+            1.0 - p1_matrix,
+            pad_width=1,
+            mode="constant",
+            constant_values=0,
+        )
+        strategy_border_for_matrix = np.pad(
+            q1_matrix,
+            pad_width=1,
+            mode="constant",
+            constant_values=0,
+        )
         qr_optimal, probability_optimal = make_prob_matrix(
             N,
-            np.pad(p1_matrix, pad_width=1, mode="constant", constant_values=0).T,
-            np.pad(q1_matrix, pad_width=1, mode="constant", constant_values=0).T,
+            strategy_center_for_matrix,
+            strategy_border_for_matrix,
         )
         mean_time, state_mean_times = find_mean_time_banded(probability_optimal, N - 1)
         mean_times.append(mean_time)
